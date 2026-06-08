@@ -1,0 +1,38 @@
+name: customer-support-agent
+version: "1.0.0"
+description: "Intelligent customer support agent with memory"
+
+policy:
+  max_cost_per_run: 0.05
+  quality: high
+  latency: fast
+  max_retries: 3
+
+memory:
+  semantic: true
+  long_term: true
+  entity: true
+  relationship: false
+  ttl_seconds: 86400
+
+tools:
+  - name: search_knowledge_base
+    description: Search the product knowledge base for relevant documentation
+  - name: get_order_status
+    description: Look up the status of a customer order
+
+prompts:
+  system: |
+    You are an expert customer support agent.
+    Your goal is to resolve customer issues quickly and accurately.
+    Always be empathetic and professional.
+    Use the knowledge base to find accurate answers.
+
+  user_template: |
+    Customer message: {user_message}
+    Context: {retrieved_context}
+    Provide a helpful, accurate response.
+
+metadata:
+  category: support
+  language: en

@@ -1,0 +1,126 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build Windows binary
+        run: |
+          cd cmd/aether
+          go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o ../../dist/aether.exe .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aether-windows
+          path: dist/aether.exe
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build Mac binary (Intel + Apple Silicon)
+        run: |
+          mkdir -p dist
+          GOARCH=amd64 GOOS=darwin go build -ldflags="-s -w" -o dist/aether-mac-intel ./cmd/aether
+          GOARCH=arm64 GOOS=darwin go build -ldflags="-s -w" -o dist/aether-mac-arm ./cmd/aether
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aether-mac
+          path: dist/aether-mac-*
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build Linux binary
+        run: |
+          mkdir -p dist
+          GOARCH=amd64 GOOS=linux go build -ldflags="-s -w" -o dist/aether-linux ./cmd/aether
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aether-linux
+          path: dist/aether-linux
+
+  release:
+    needs: [build-windows, build-mac, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Aether ${{ github.ref_name }}"
+          body: |
+            ## Aether ${{ github.ref_name }} — AI Compiler and Runtime
+
+            ### Installation
+
+            **Windows**
+            1. Download `aether.exe`
+            2. Move to `C:\Windows\System32\`
+            3. Open any terminal: `aether --help`
+
+            **Mac (Apple Silicon)**
+            ```bash
+            curl -L https://github.com/Orbis-Mind/aether/releases/download/${{ github.ref_name }}/aether-mac-arm -o /usr/local/bin/aether
+            chmod +x /usr/local/bin/aether
+            aether --help
+            ```
+
+            **Mac (Intel)**
+            ```bash
+            curl -L https://github.com/Orbis-Mind/aether/releases/download/${{ github.ref_name }}/aether-mac-intel -o /usr/local/bin/aether
+            chmod +x /usr/local/bin/aether
+            aether --help
+            ```
+
+            **Linux**
+            ```bash
+            curl -L https://github.com/Orbis-Mind/aether/releases/download/${{ github.ref_name }}/aether-linux -o /usr/local/bin/aether
+            chmod +x /usr/local/bin/aether
+            aether --help
+            ```
+
+            ### Quick Start
+            ```
+            aether init my-agent
+            cd my-agent
+            aether build
+            aether run --mock --message "Hello"
+            aether stats
+            ```
+          files: |
+            dist/aether.exe
+            dist/aether-mac-intel
+            dist/aether-mac-arm
+            dist/aether-linux

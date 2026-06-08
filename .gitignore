@@ -1,0 +1,10 @@
+dist/
+*.ae
+.aether/
+!.aether/.gitignore
+*.exe
+!dist/*.exe
+*.test
+*.out
+.DS_Store
+Thumbs.db

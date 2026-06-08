@@ -1,0 +1,37 @@
+name: code-reviewer
+version: "1.0.0"
+description: "Automated code review with security and quality analysis"
+
+policy:
+  max_cost_per_run: 0.10
+  quality: expert
+  latency: balanced
+  max_retries: 2
+
+memory:
+  semantic: true
+  long_term: false
+  entity: false
+
+tools:
+  - name: run_linter
+    description: Run linter on the provided code snippet
+  - name: check_security
+    description: Check code for common security vulnerabilities
+
+prompts:
+  system: |
+    You are a senior software engineer conducting thorough code reviews.
+    Analyze code for correctness, security vulnerabilities, performance
+    issues, code style, and test coverage gaps.
+    Rate severity as: Critical | High | Medium | Low | Info
+
+  user_template: |
+    Review this code:
+    {code}
+
+    Focus: {focus_areas}
+
+metadata:
+  category: development
+  supported_languages: python,javascript,typescript,go,rust

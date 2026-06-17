@@ -36,14 +36,15 @@ deps:
 	go mod download
 
 # Demo run
-demo:
+demo: build
 	@mkdir -p /tmp/aether-demo
-	./dist/aether init demo-project --dir /tmp/aether-demo/demo-project
-	cd /tmp/aether-demo/demo-project && ../../dist/aether build
-	cd /tmp/aether-demo/demo-project && ../../dist/aether test
-	cd /tmp/aether-demo/demo-project && ../../dist/aether run --mock --message "Hello Aether"
-	cd /tmp/aether-demo/demo-project && ../../dist/aether benchmark --runs 5
-	cd /tmp/aether-demo/demo-project && ../../dist/aether stats
+	$(eval AETHER := $(abspath dist/aether))
+	$(AETHER) init demo-project --dir /tmp/aether-demo/demo-project
+	cd /tmp/aether-demo/demo-project && $(AETHER) build
+	cd /tmp/aether-demo/demo-project && $(AETHER) test
+	cd /tmp/aether-demo/demo-project && $(AETHER) run --mock --message "Hello Aether"
+	cd /tmp/aether-demo/demo-project && $(AETHER) benchmark --runs 5
+	cd /tmp/aether-demo/demo-project && $(AETHER) stats
 
 # Clean build artifacts
 clean:

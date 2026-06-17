@@ -38,8 +38,10 @@ var complexityQuality = map[core.TaskComplexity]float64{
 // Scoring weights
 const (
 	wQuality = 0.50
-	wCost    = 0.35
-	wLatency = 0.15
+	wCost    = 0.30
+	wLatency = 0.10
+	wStorage = 0.10 // favors smaller local models — all local models cost $0,
+	// so disk footprint is what differentiates them ("less storage").
 )
 
 // ─────────────────────────────────────────────
@@ -81,6 +83,26 @@ func (r *Router) Select(
 	return scored[0].key, nil
 }
 
+// providerEligible decides whether a model's provider is allowed for routing.
+//   - An explicit allowed_providers list always wins when present.
+//   - prefer_local restricts routing to local (Ollama) models only.
+//   - By default, local models are opt-in (they need Ollama running + a pulled
+//     model), so hosted APIs are used unless the user asks for local.
+func providerEligible(spec core.ModelSpec, policy core.Policy) bool {
+	if len(policy.AllowedProviders) > 0 {
+		for _, p := range policy.AllowedProviders {
+			if strings.EqualFold(p, string(spec.Provider)) {
+				return true
+			}
+		}
+		return false
+	}
+	if policy.PreferLocal {
+		return spec.IsLocal()
+	}
+	return !spec.IsLocal()
+}
+
 func (r *Router) filter(
 	complexity core.TaskComplexity,
 	policy core.Policy,
@@ -97,17 +119,8 @@ func (r *Router) filter(
 		if spec.Provider == core.ProviderMock {
 			continue
 		}
-		if len(policy.AllowedProviders) > 0 {
-			allowed := false
-			for _, p := range policy.AllowedProviders {
-				if strings.EqualFold(p, string(spec.Provider)) {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
-				continue
-			}
+		if !providerEligible(spec, policy) {
+			continue
 		}
 		if spec.QualityScore < minQuality {
 			continue
@@ -129,6 +142,7 @@ func (r *Router) filter(
 func (r *Router) score(keys []string, inputTokens, outputTokens int) []scoredModel {
 	maxCost := 0.0
 	maxLatency := 0.0
+	maxDisk := 0.0
 	for _, k := range keys {
 		m := core.ModelCatalogue[k]
 		c := m.CostEstimate(inputTokens, outputTokens)
@@ -139,12 +153,18 @@ func (r *Router) score(keys []string, inputTokens, outputTokens int) []scoredMod
 		if lat > maxLatency {
 			maxLatency = lat
 		}
+		if m.ApproxDiskGB > maxDisk {
+			maxDisk = m.ApproxDiskGB
+		}
 	}
 	if maxCost == 0 {
 		maxCost = 1
 	}
 	if maxLatency == 0 {
 		maxLatency = 1
+	}
+	if maxDisk == 0 {
+		maxDisk = 1
 	}
 
 	var result []scoredModel
@@ -153,7 +173,8 @@ func (r *Router) score(keys []string, inputTokens, outputTokens int) []scoredMod
 		c := m.CostEstimate(inputTokens, outputTokens)
 		s := wQuality*m.QualityScore -
 			wCost*(c/maxCost) -
-			wLatency*(float64(m.AvgLatencyMS)/maxLatency)
+			wLatency*(float64(m.AvgLatencyMS)/maxLatency) -
+			wStorage*(m.ApproxDiskGB/maxDisk)
 		result = append(result, scoredModel{key: k, score: s, cost: c})
 	}
 	return result

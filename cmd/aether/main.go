@@ -64,15 +64,39 @@ func findArtifact(path string) (string, error) {
 
 func dataDir() string { os.MkdirAll(".aether", 0755); return ".aether" }
 
+// splitArgs separates flag arguments from positional arguments so that flags
+// may appear before or after positionals (Go's flag package stops at the first
+// positional). Flags that take a value are passed as "--flag value".
+func splitArgs(args []string) (flags []string, positional []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+			// If it's not "--flag=value" and a value follows, consume it.
+			if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				flags = append(flags, args[i+1])
+				i++
+			}
+		} else {
+			positional = append(positional, a)
+		}
+	}
+	return flags, positional
+}
+
 // ─── init ─────────────────────────────────────────────────────────────────
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	dir := fs.String("dir", "", "directory to create project in")
-	fs.Parse(args)
+	// Go's flag package stops at the first positional arg, so flags placed
+	// after the project name (e.g. `init my-agent --dir foo`) would be ignored.
+	// Reorder so all flags are parsed regardless of position.
+	flags, positional := splitArgs(args)
+	fs.Parse(flags)
 
 	banner()
 	name := "my-agent"
-	if fs.NArg() > 0 { name = fs.Arg(0) }
+	if len(positional) > 0 { name = positional[0] }
 	dest := *dir; if dest == "" { dest = name }
 	os.MkdirAll(dest, 0755)
 
@@ -85,6 +109,13 @@ policy:
   quality: balanced
   latency: balanced
   max_retries: 3
+  # Run fully local & free via Ollama (no API key needed).
+  # Uncomment, then: ollama serve && ollama pull llama3.2
+  # prefer_local: true
+  # Or pin specific providers, e.g. [ollama] or [openai, anthropic]:
+  # allowed_providers: [ollama]
+  # Tried in order if the primary model fails:
+  # fallback_models: [llama3.2, gpt-4o-mini]
 
 memory:
   semantic: true

@@ -35,6 +35,7 @@ type ModelProvider string
 const (
 	ProviderAnthropic ModelProvider = "anthropic"
 	ProviderOpenAI    ModelProvider = "openai"
+	ProviderOllama    ModelProvider = "ollama"
 	ProviderMock      ModelProvider = "mock"
 )
 
@@ -47,7 +48,13 @@ type ModelSpec struct {
 	AvgLatencyMS       int
 	QualityScore       float64
 	SupportsTools      bool
+	// ApproxDiskGB is the rough on-disk footprint of a local (Ollama) model,
+	// shown so users can trade quality against storage. Zero for hosted APIs.
+	ApproxDiskGB       float64
 }
+
+// IsLocal reports whether the model runs locally (no network/API key, zero cost).
+func (m ModelSpec) IsLocal() bool { return m.Provider == ProviderOllama }
 
 func (m ModelSpec) CostEstimate(inputTokens, outputTokens int) float64 {
 	return (float64(inputTokens)/1000)*m.CostPerInputToken +
@@ -80,6 +87,39 @@ var ModelCatalogue = map[string]ModelSpec{
 		ContextWindow: 128_000, CostPerInputToken: 0.005, CostPerOutputToken: 0.015,
 		AvgLatencyMS: 2500, QualityScore: 0.90, SupportsTools: true,
 	},
+	// ─── Local models via Ollama (zero cost, runs on your machine) ───
+	// IDs are Ollama tags — pull with e.g. `ollama pull llama3.2`.
+	// Small footprint first, so a laptop can run them with little storage.
+	"phi3": {
+		ID: "phi3", Provider: ProviderOllama,
+		ContextWindow: 128_000, CostPerInputToken: 0.0, CostPerOutputToken: 0.0,
+		AvgLatencyMS: 1400, QualityScore: 0.66, SupportsTools: false, ApproxDiskGB: 2.3,
+	},
+	"llama3.2": {
+		ID: "llama3.2", Provider: ProviderOllama,
+		ContextWindow: 128_000, CostPerInputToken: 0.0, CostPerOutputToken: 0.0,
+		AvgLatencyMS: 1500, QualityScore: 0.69, SupportsTools: true, ApproxDiskGB: 2.0,
+	},
+	"gemma2": {
+		ID: "gemma2:2b", Provider: ProviderOllama,
+		ContextWindow: 8_192, CostPerInputToken: 0.0, CostPerOutputToken: 0.0,
+		AvgLatencyMS: 1300, QualityScore: 0.71, SupportsTools: false, ApproxDiskGB: 1.6,
+	},
+	"mistral": {
+		ID: "mistral", Provider: ProviderOllama,
+		ContextWindow: 32_768, CostPerInputToken: 0.0, CostPerOutputToken: 0.0,
+		AvgLatencyMS: 2200, QualityScore: 0.76, SupportsTools: true, ApproxDiskGB: 4.1,
+	},
+	"llama3.1": {
+		ID: "llama3.1", Provider: ProviderOllama,
+		ContextWindow: 128_000, CostPerInputToken: 0.0, CostPerOutputToken: 0.0,
+		AvgLatencyMS: 2500, QualityScore: 0.79, SupportsTools: true, ApproxDiskGB: 4.9,
+	},
+	"qwen2.5": {
+		ID: "qwen2.5", Provider: ProviderOllama,
+		ContextWindow: 128_000, CostPerInputToken: 0.0, CostPerOutputToken: 0.0,
+		AvgLatencyMS: 2200, QualityScore: 0.81, SupportsTools: true, ApproxDiskGB: 4.7,
+	},
 	"mock": {
 		ID: "mock", Provider: ProviderMock,
 		ContextWindow: 1_000_000, CostPerInputToken: 0.0, CostPerOutputToken: 0.0,
@@ -94,6 +134,9 @@ type Policy struct {
 	MaxRetries       int            `yaml:"max_retries"`
 	FallbackModels   []string       `yaml:"fallback_models"`
 	AllowedProviders []string       `yaml:"allowed_providers"`
+	// PreferLocal restricts routing to local (Ollama) models — zero cost,
+	// fully private, no API key. Set `prefer_local: true` in the spec.
+	PreferLocal      bool           `yaml:"prefer_local"`
 }
 
 func DefaultPolicy() Policy {

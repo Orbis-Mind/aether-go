@@ -53,6 +53,10 @@ func ValidateYAML(path string) (*core.AetherSpec, error) {
 		for _, fb := range yamlx.GetSlice(pm, "fallback_models") {
 			if s, ok := fb.(string); ok { spec.Policy.FallbackModels = append(spec.Policy.FallbackModels, s) }
 		}
+		for _, ap := range yamlx.GetSlice(pm, "allowed_providers") {
+			if s, ok := ap.(string); ok { spec.Policy.AllowedProviders = append(spec.Policy.AllowedProviders, s) }
+		}
+		spec.Policy.PreferLocal = yamlx.GetBool(pm, "prefer_local")
 	}
 
 	if mm := yamlx.GetMap(raw, "memory"); mm != nil {

@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,20 @@ import (
 	"github.com/Orbis-Mind/aether/internal/memory"
 	"github.com/Orbis-Mind/aether/internal/observability"
 )
+
+// permanentError marks a failure that won't be fixed by retrying (e.g. a
+// missing API key or an authentication failure). The retry loop fails fast on
+// these instead of burning exponential backoff on a hopeless call.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func permanent(format string, a ...any) error {
+	return &permanentError{fmt.Errorf(format, a...)}
+}
+func isPermanent(err error) bool {
+	var p *permanentError
+	return errors.As(err, &p)
+}
 
 // ─────────────────────────────────────────────
 // Model Response
@@ -59,7 +74,7 @@ type anthropicResponse struct {
 func callAnthropic(modelID, system, user string, maxTokens int) (*modelResponse, error) {
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
-		return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
+		return nil, permanent("ANTHROPIC_API_KEY not set — export your key (export ANTHROPIC_API_KEY=sk-ant-...) or run with --mock")
 	}
 
 	reqBody := anthropicRequest{
@@ -137,7 +152,7 @@ type openAIResponse struct {
 func callOpenAI(modelID, system, user string, maxTokens int) (*modelResponse, error) {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
-		return nil, fmt.Errorf("OPENAI_API_KEY not set")
+		return nil, permanent("OPENAI_API_KEY not set — export your key (export OPENAI_API_KEY=sk-...) or run with --mock")
 	}
 
 	reqBody := openAIRequest{
@@ -180,6 +195,100 @@ func callOpenAI(modelID, system, user string, maxTokens int) (*modelResponse, er
 }
 
 // ─────────────────────────────────────────────
+// Ollama Client (local models — zero cost, no API key)
+// ─────────────────────────────────────────────
+
+type ollamaRequest struct {
+	Model    string          `json:"model"`
+	Messages []ollamaMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+	Options  ollamaOptions   `json:"options"`
+}
+
+type ollamaMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ollamaOptions struct {
+	NumPredict int `json:"num_predict"`
+}
+
+type ollamaResponse struct {
+	Message struct {
+		Content string `json:"content"`
+	} `json:"message"`
+	PromptEvalCount int    `json:"prompt_eval_count"`
+	EvalCount       int    `json:"eval_count"`
+	Error           string `json:"error,omitempty"`
+}
+
+func ollamaHost() string {
+	host := os.Getenv("OLLAMA_HOST")
+	if host == "" {
+		return "http://localhost:11434"
+	}
+	// Allow bare host:port (Ollama's own env convention) as well as a full URL.
+	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+		host = "http://" + host
+	}
+	return strings.TrimRight(host, "/")
+}
+
+func callOllama(modelID, system, user string, maxTokens int) (*modelResponse, error) {
+	reqBody := ollamaRequest{
+		Model:  modelID,
+		Stream: false,
+		Messages: []ollamaMessage{
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
+		},
+		Options: ollamaOptions{NumPredict: maxTokens},
+	}
+	body, _ := json.Marshal(reqBody)
+
+	req, _ := http.NewRequest("POST", ollamaHost()+"/api/chat", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	// Local generation can be slow on first load (model paged into RAM/VRAM).
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		// Connection refused / DNS — Ollama almost certainly isn't running.
+		return nil, permanent("cannot reach Ollama at %s — start it with `ollama serve` and pull a model (`ollama pull %s`)", ollamaHost(), modelID)
+	}
+	defer resp.Body.Close()
+
+	respData, _ := io.ReadAll(resp.Body)
+	var or ollamaResponse
+	json.Unmarshal(respData, &or)
+
+	if or.Error != "" {
+		// e.g. model not pulled yet — retrying won't help, guide the user.
+		return nil, permanent("Ollama error: %s (try `ollama pull %s`)", or.Error, modelID)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Ollama HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respData)))
+	}
+
+	// Ollama returns real token counts; fall back to an estimate if absent.
+	inTok := or.PromptEvalCount
+	if inTok == 0 {
+		inTok = core.EstimateTokens(system) + core.EstimateTokens(user)
+	}
+	outTok := or.EvalCount
+	if outTok == 0 {
+		outTok = core.EstimateTokens(or.Message.Content)
+	}
+
+	return &modelResponse{
+		Text:         or.Message.Content,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+	}, nil
+}
+
+// ─────────────────────────────────────────────
 // Mock Client
 // ─────────────────────────────────────────────
 
@@ -216,6 +325,8 @@ func dispatch(modelKey, system, user string, maxTokens int) (*modelResponse, err
 		return callAnthropic(spec.ID, system, user, maxTokens)
 	case core.ProviderOpenAI:
 		return callOpenAI(spec.ID, system, user, maxTokens)
+	case core.ProviderOllama:
+		return callOllama(spec.ID, system, user, maxTokens)
 	case core.ProviderMock:
 		return callMock(system, user), nil
 	default:
@@ -312,6 +423,11 @@ func (r *Runtime) Run(userMessage string, variables map[string]string) *core.Exe
 				break
 			}
 			lastErr = err
+			// Don't retry/backoff on permanent errors (missing key, auth) —
+			// fail fast and let the outer loop try a fallback model instead.
+			if isPermanent(err) {
+				break
+			}
 			if attempt < r.spec.Policy.MaxRetries {
 				backoff := time.Duration(1<<uint(attempt)) * 500 * time.Millisecond
 				time.Sleep(backoff)

@@ -1,72 +1,77 @@
-# Aether ⚡ — AI Compiler and Runtime (Go Edition)
+<p align="center">
+  <img src="docs/banner.png" alt="Aether — AI Compiler & Runtime. Write once. Aether picks the best model." width="820">
+</p>
 
-> Make AI development as simple as Docker made application deployment.
+<h1 align="center">Aether ⚡ — Policy Compiler & Free-First Router for AI</h1>
 
-**Single binary. Zero dependencies. Instant startup. Works on any laptop.**
+> You write a **policy**. Aether classifies the task, filters models by your
+> constraints, and routes to the best-fitting model — preferring **local** models
+> so your default path costs **$0** and stays private.
 
----
+**Single static binary. Zero external Go dependencies. Local-first. Works offline once a model is pulled.**
 
-## Install
+Aether is not another API wrapper. It is a small compiler + runtime that turns
+`agent.ae.yaml` into an execution plan and picks *which model, strategy, and
+fallback path* to use for each workload.
 
-**Windows** — Download `aether.exe`, move to `C:\Windows\System32\`
+## How it flows
 
-**Mac (Apple Silicon)**
-```bash
-curl -L https://github.com/Orbis-Mind/aether/releases/latest/download/aether-mac-arm -o /usr/local/bin/aether
-chmod +x /usr/local/bin/aether
-```
+The lifecycle of one request — **define → compile → route → run → observe →
+result**, with measured results feeding back to improve future routing:
 
-**Mac (Intel)**
-```bash
-curl -L https://github.com/Orbis-Mind/aether/releases/latest/download/aether-mac-intel -o /usr/local/bin/aether
-chmod +x /usr/local/bin/aether
-```
-
-**Linux**
-```bash
-curl -L https://github.com/Orbis-Mind/aether/releases/latest/download/aether-linux -o /usr/local/bin/aether
-chmod +x /usr/local/bin/aether
-```
-
-**One-line Windows installer (PowerShell as Admin)**
-```powershell
-irm https://raw.githubusercontent.com/Orbis-Mind/aether/main/install.ps1 | iex
-```
-
----
-
-## Quick Start
-
-```bash
-aether init my-agent
-cd my-agent
-
-aether build       # compiles agent.ae.yaml → .ae artifact, selects best model
-aether test        # validates spec, shows full routing decision table
-aether run --mock  # runs with mock model (no API key needed)
-aether benchmark   # measures latency, cost, success rate
-aether publish     # pushes to local Aether Registry
-aether stats       # shows cost/token/latency analytics
+```mermaid
+flowchart LR
+  A["1 · DEFINE<br/><code>agent.ae.yaml</code><br/>policy · memory · tools"]
+  B["2 · COMPILE<br/>validate · optimize<br/>build execution plan"]
+  C["3 · ROUTE<br/>score models on<br/>quality · cost · latency"]
+  D["4 · RUNTIME<br/>memory · cache<br/>fallback · streaming"]
+  E["5 · OBSERVE<br/>logs · metrics<br/>routing dataset"]
+  F["6 · RESULT<br/>output · tokens<br/>cost · latency · run id"]
+  A --> B --> C --> D --> E --> F
+  F -. "feedback: measured quality improves routing" .-> A
 ```
 
 ---
 
-## With a Real AI Model
+## Why
+
+Most "LLM gateways" make you hardcode a model. Aether inverts that: you declare
+what you care about (quality, cost, latency, privacy), and the router decides.
+Because the default is **local-first**, a developer with a laptop and **no
+budget** can run the whole thing — no OpenAI/Anthropic/cloud account required.
+
+Optional cloud providers exist behind the same interface, but are **never
+required** and are excluded entirely under a `privacy: local` policy.
+
+---
+
+## Quick start ($0, no API key)
 
 ```bash
-# Anthropic (Claude)
-set ANTHROPIC_API_KEY=sk-ant-...   # Windows
-export ANTHROPIC_API_KEY=sk-ant-... # Mac/Linux
-aether run --message "Explain quantum computing"
+# 1. Install a free local model runtime (once)
+#    https://ollama.com  — then:
+ollama serve
+ollama pull llama3.2            # ~2GB
 
-# OpenAI (GPT)
-set OPENAI_API_KEY=sk-...
-aether run --message "Explain quantum computing"
+# 2. Build Aether
+go build -o aether ./cmd/aether
+
+# 3. Scaffold, check your environment, and run — fully local
+./aether init my-agent && cd my-agent
+../aether doctor               # checks Go, Ollama, models, permissions (with fixes)
+../aether build
+../aether run --local --message "Explain caching in one paragraph"
+```
+
+No Ollama yet? Everything still works with the mock model:
+
+```bash
+aether run --mock --message "Hello"
 ```
 
 ---
 
-## Write Your Agent
+## The policy (what you actually write)
 
 ```yaml
 # agent.ae.yaml
@@ -74,135 +79,230 @@ name: my-agent
 version: "1.0.0"
 
 policy:
-  max_cost_per_run: 0.05   # USD budget — router picks model automatically
-  quality: high             # draft | balanced | high | expert
-  latency: fast             # realtime | fast | balanced | batch
-
-memory:
-  semantic: true            # similarity-based context retrieval
-  long_term: true           # persist facts across sessions
-
-tools:
-  - name: search_kb
-    description: Search the knowledge base
+  quality:   { minimum: 0.80 }     # absolute quality floor (0..1)
+  cost:      { max_per_run: 0.01 } # USD budget per run
+  latency:   { max_p95: 2000 }     # ms
+  privacy:   { level: local }      # HARD guarantee: never calls cloud
+  execution: { local_first: true } # prefer an installed local model
+  fallback:  { enabled: true, max_attempts: 2 }
 
 prompts:
-  system: |
-    You are a helpful assistant.
-  user_template: |
-    {user_message}
+  system: You are a helpful assistant.
+  user_template: "{user_message}"
 ```
 
-```bash
-aether build   # router automatically selects best model for your policy
-aether run
-```
+The original flat form (`quality: balanced`, `max_cost_per_run: 0.05`,
+`latency: fast`, `prefer_local: true`) still works — both are supported.
 
 ---
 
-## How Model Selection Works
+## Routing strategies
 
-Aether automatically scores every model and picks the best one:
-
-```
-Score = 0.50 × quality − 0.35 × cost − 0.15 × latency
-
-Model              Quality   Cost/run   Latency   Eligible
-─────────────────────────────────────────────────────────
-gpt-4o-mini         0.70    $0.00024    700ms        ✓  ← selected (best score)
-claude-haiku-3-5    0.72    $0.00203    800ms        ✓
-claude-sonnet-3-5   0.88    $0.00608   2000ms        ✓
-gpt-4o              0.90    $0.00614   2500ms        ✓
-claude-opus-4       0.97    $0.03042   5000ms        ✓
+```bash
+aether run --strategy auto       # balanced quality/cost/latency (default)
+aether run --strategy cheapest   # lowest cost that meets policy
+aether run --strategy fastest    # lowest latency that meets policy
+aether run --strategy best       # highest quality that meets policy
+aether run --strategy local      # local-only ($0, private)
+aether run --local               # same as --strategy local
+aether run --stream              # stream tokens as they generate
 ```
 
-Change `quality: expert` → Aether picks `claude-opus-4` automatically.
-Change `max_cost_per_run: 0.001` → Aether picks `gpt-4o-mini` automatically.
+The pipeline is fully transparent — `aether test` shows every candidate and why
+it was kept or rejected:
 
-You never touch model names.
+```
+Intelligent Routing Analysis
+==============================================================================
+Task: coding         Difficulty: 0.65  Risk: moderate Reasoning:false Tools:false
+Strategy: auto       Min-quality: 0.82  Budget: $0.010000  Max-latency: 3000ms
+------------------------------------------------------------------------------
+Model               Quality   Prov     Cost $   Latency  Status
+------------------------------------------------------------------------------
+qwen2.5                0.81    est    0.00000    2200ms  ✗ quality 0.81 < required 0.82
+gpt-4o-mini            0.70    est    0.00024     700ms  ✗ quality 0.70 < required 0.82
+claude-sonnet-3-5      0.88    est    0.00608    2000ms  ★ SELECTED
+```
+
+`Prov` is the quality **provenance**: `meas` (measured by `aether evaluate` on
+your machine), `est` (estimated prior), or `unk` (unknown). Aether never
+presents an estimate as a measurement.
+
+---
+
+## Free, offline evaluation
+
+Aether ships an original benchmark dataset and a heuristic scorer that runs with
+**no paid API**. It measures your locally-available models and feeds the results
+back into routing.
+
+```bash
+aether evaluate                       # uses installed local models + built-in dataset
+aether evaluate my-dataset.json       # bring your own prompts
+```
+
+```
+AETHER MODEL EVALUATION
+================================================================
+Dataset: aether-basic-v1
+Tasks:   44
+
+Model            Quality        P95    Success   Tokens
+----------------------------------------------------------------
+qwen2.5          78.4%        1900ms      98%   5120/meas
+llama3.2         71.2%        1400ms      95%   4880/meas
+----------------------------------------------------------------
+Recommendation:
+  qwen2.5
+
+Reason:
+  Best MEASURED quality on this dataset. Not a claim about any
+  other workload — measure your own prompts to route on your data.
+```
+
+Measured scores are written to `.aether/observability/benchmarks.json` and
+overlay the registry, so future `aether run`/`aether test` route on **your**
+data, not vendor claims.
+
+> **Honesty note:** the built-in scorer is a deterministic keyword/regex
+> heuristic — a proxy for quality, clearly labelled as such. It is not a human
+> judgment or an LLM-as-judge. Items with no deterministic expectation are
+> reported as *unscorable*, never fabricated.
+
+---
+
+## Reproducible benchmark: Aether routing vs. "always strongest"
+
+The point of routing is to do at least as well as always picking the strongest
+model, while spending less (cost/latency/compute). To reproduce on your machine:
+
+```bash
+ollama pull llama3.2 && ollama pull qwen2.5     # two local models
+aether evaluate                                  # measures both on aether-basic-v1
+# Compare: routing per-task (aether test on varied prompts) vs. forcing the
+# strongest model on every task (--strategy best). Routing should match quality
+# on easy tasks while using the smaller/faster model, lowering p95 and compute.
+```
+
+Because results depend on which models you pulled and your hardware, this repo
+does **not** ship fabricated numbers. Run the command above to generate a report
+you can trust. See `evaluation/datasets/aether-basic-v1.json` (44 original,
+CC0 prompts across 10 categories) — add your own.
 
 ---
 
 ## Architecture
 
+Everything below the router is provider-agnostic — local and cloud backends are
+peers behind one `ModelProvider` interface. The default path never leaves your
+machine.
+
+```mermaid
+flowchart TB
+  spec["agent.ae.yaml"] --> compiler["Compiler<br/><small>validate · optimize prompts · estimate tokens</small>"]
+  compiler --> classifier["Classifier<br/><small>task · difficulty · risk · tools</small>"]
+  classifier --> policy["Policy Engine<br/><small>cost · quality · latency · privacy</small>"]
+  policy --> router["Intelligent Router<br/><small>strategy-based selection</small>"]
+
+  router --> ollama["Ollama<br/><small>local · $0</small>"]
+  router --> compat["OpenAI-compatible<br/><small>vLLM / local server</small>"]
+  router --> cloud["Optional cloud<br/><small>OpenAI · Anthropic</small>"]
+
+  subgraph RT["Runtime"]
+    direction LR
+    cache["Cache<br/><small>safety-guarded</small>"] --> memory["Memory<br/><small>local vectors</small>"] --> exec["Provider call<br/><small>retry · jitter · fallback · streaming</small>"]
+  end
+  ollama --> cache
+  compat --> cache
+  cloud --> cache
+  exec --> out["Response + Observability + Routing dataset"]
+  out -. "measured quality overlays the registry" .-> router
+
+  classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20;
+  classDef opt fill:#f3e5f5,stroke:#8e24aa,color:#4a148c;
+  class ollama,compat local;
+  class cloud opt;
 ```
-agent.ae.yaml
-     │
-     ▼
- Compiler          Validates YAML, optimises prompts,
-                   estimates tokens, runs Router
-     │
-     ▼
-  Router           Scores all models on quality/cost/latency
-                   Picks the winner within your policy
-     │
-     ▼
- .ae Artifact      Binary format: magic header + ZIP
-                   Contains: spec, plan, optimised prompts
-     │
-     ▼
-  Runtime          Checks cache → retrieves memory →
-                   calls model API → stores results →
-                   records observability
-     │
-     ▼
-ExecutionResult    output, model, tokens, cost, latency, run_id
+
+**The routing pipeline** (what "3 · ROUTE" expands to):
+
+```mermaid
+flowchart LR
+  req["Request"] --> ta["Task Analysis<br/><small>type · difficulty · risk</small>"]
+  ta --> pf["Policy Filter<br/><small>cost · quality · latency · privacy</small>"]
+  pf --> cand["Candidate Models"]
+  cand --> cap["Capability Match<br/><small>tools · context window</small>"]
+  cap --> score["Score<br/><small>quality · cost · latency</small>"]
+  score --> avail["Availability<br/><small>installed local only</small>"]
+  avail --> sel["Final Selection<br/><small>per strategy</small>"]
 ```
+
+**Fallback & resilience** (never a retry storm):
+
+```mermaid
+flowchart LR
+  P["Primary model"] -->|ok| R["Response"]
+  P -->|"transient error"| RT["Retry: backoff + jitter"] --> P
+  P -->|"permanent error (no key / not pulled)"| F1["Fallback model"]
+  F1 -->|ok| R
+  F1 -->|fails| F2["Next fallback (bounded by max_attempts)"]
+  F2 -->|"all fail"| E["Explicit error (never swallowed)"]
+```
+
+- **Provider abstraction** (`internal/provider`): every backend implements one
+  small `ModelProvider` interface (`Generate`, `Stream`, `Capabilities`). Local
+  and cloud are peers; the runtime has zero provider-specific code.
+- **Model registry** (`internal/models`): capabilities, pricing, and quality
+  with explicit `measured/estimated/unknown` provenance.
+- **Classifier** (`internal/classifier`): offline heuristic task analysis
+  (type, difficulty, risk, reasoning/tools) behind a swappable interface.
+- **Policy engine** (`internal/policy`): enforces cost/quality/latency/privacy
+  *before* selection; `privacy: local` is a hard cloud-exclusion guarantee.
+- **Router pipeline** (`internal/router`): task → policy filter → capability /
+  quality / cost / latency scoring → selection, with strategies.
+- **Runtime** (`internal/runtime`): cache (with time-sensitive/personal/secret
+  safeguards) → memory → provider call with retry+jitter+fallback → streaming.
 
 ---
 
-## CLI Reference
+## CLI reference
 
 | Command | Description |
 |---------|-------------|
 | `aether init [name]` | Scaffold a new project |
-| `aether build` | Compile spec → .ae artifact |
-| `aether run` | Execute artifact |
-| `aether run --mock` | Execute with mock (no API key) |
-| `aether run --message "..."` | Run with inline message |
-| `aether test` | Validate + routing analysis |
-| `aether benchmark --runs N` | Performance benchmark |
-| `aether publish` | Publish to registry |
-| `aether pull <name>` | Pull from registry |
-| `aether search [query]` | Search registry |
+| `aether build` | Compile spec → `.ae` artifact |
+| `aether run` | Execute (free-first: prefers installed local model) |
+| `aether run --local / --strategy S / --stream` | Force local / pick strategy / stream |
+| `aether models` | Local (Ollama) + catalogue models with quality provenance |
+| `aether doctor` | Check Go, Ollama, models, permissions — with fixes |
+| `aether evaluate [dataset]` | Offline model benchmark (measures real quality) |
+| `aether inspect [artifact]` | Show a compiled `.ae` plan and routing |
+| `aether test` | Validate spec + show the routing decision |
+| `aether benchmark --runs N` | Runtime cost/latency/quality benchmark |
 | `aether stats` | Observability report |
-| `aether --version` | Show version |
+| `aether publish/pull/search` | Local artifact registry |
 
 ---
 
-## Build from Source
+## Build from source
 
 Requires Go 1.22+. Zero external dependencies.
 
 ```bash
-git clone https://github.com/Orbis-Mind/aether
-cd aether
-
-# Build for your OS
 go build -o aether ./cmd/aether
-
-# Build all platforms
-make build-all
-
-# Run tests
-go test ./tests/ -v
+go test ./...          # 70 tests, all offline
+gofmt -l internal cmd  # formatting check (CI-enforced)
+go vet ./...
 ```
 
 ---
 
-## Binary Sizes
+## What Aether does NOT require
 
-| Platform | Size |
-|----------|------|
-| Windows (aether.exe) | ~5.7 MB |
-| Mac Apple Silicon | ~5.4 MB |
-| Mac Intel | ~5.7 MB |
-| Linux x64 | ~5.6 MB |
-
-Single static binary. No runtime. No installer. Just copy and run.
-
----
+No OpenAI/Anthropic/Gemini credits · no AWS/GCP/Azure · no paid database ·
+no Pinecone/Weaviate · no Datadog/Grafana Cloud · no credit card. Cloud
+integrations are optional adapters, off by default.
 
 ## License
 
-MIT © Orbis-Mind
+MIT © Orbis-Mind. Benchmark dataset: CC0 (original content).

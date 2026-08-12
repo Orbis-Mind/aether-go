@@ -7,11 +7,20 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
 )
 
 const defaultTTL = 3600
-const semanticThreshold = 0.92
+
+// semanticThreshold is intentionally high: the built-in n-gram embedding is a
+// cheap approximation and unrelated prompts can score deceptively high, so a
+// cosine hit alone is NOT trusted.
+const semanticThreshold = 0.95
+
+// semanticJaccardFloor is a second, independent safeguard (see Section 19 of the
+// design): a semantic hit must also share this fraction of word tokens with the
+// stored prompt. This prevents "similar-looking" but unrelated prompts from
+// returning each other's cached answers.
+const semanticJaccardFloor = 0.6
 
 // ─────────────────────────────────────────────
 // Cache Entry
@@ -25,6 +34,9 @@ type entry struct {
 	TTL       int       `json:"ttl"`
 	Hits      int       `json:"hits"`
 	Embedding []float64 `json:"embedding,omitempty"`
+	// Prompt is the full prompt for semantic entries, kept so a candidate hit can
+	// be verified by lexical overlap (not just embedding similarity).
+	Prompt string `json:"prompt,omitempty"`
 }
 
 func (e *entry) isValid() bool {
@@ -144,9 +156,16 @@ func (c *SemanticCache) Get(prompt string) (string, bool) {
 			bestEntry = e
 		}
 	}
+	// Two independent conditions must BOTH hold to return a semantic hit:
+	//   1. embedding cosine >= threshold, and
+	//   2. lexical (word-set) overlap >= floor.
+	// The toy embedding alone produces false positives on unrelated prompts, so
+	// the lexical check is what makes semantic caching safe.
 	if bestEntry != nil && bestSim >= c.threshold {
-		bestEntry.Hits++
-		return bestEntry.Value, true
+		if jaccardWords(prompt, bestEntry.Prompt) >= semanticJaccardFloor {
+			bestEntry.Hits++
+			return bestEntry.Value, true
+		}
 	}
 	return "", false
 }
@@ -162,9 +181,52 @@ func (c *SemanticCache) Set(prompt, response string, ttl int) {
 		CreatedAt: float64(time.Now().Unix()),
 		TTL:       ttl,
 		Embedding: embedText(prompt),
+		Prompt:    prompt,
 	}
 	c.entries = append(c.entries, e)
 	c.save()
+}
+
+// jaccardWords returns the Jaccard similarity of the two prompts' lowercase word
+// sets (|A∩B| / |A∪B|). Empty stored prompt (legacy entries) yields 0, which
+// safely fails the overlap check rather than trusting an unverifiable hit.
+func jaccardWords(a, b string) float64 {
+	if b == "" {
+		return 0
+	}
+	sa := wordSet(a)
+	sb := wordSet(b)
+	if len(sa) == 0 || len(sb) == 0 {
+		return 0
+	}
+	inter := 0
+	for w := range sa {
+		if sb[w] {
+			inter++
+		}
+	}
+	union := len(sa) + len(sb) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
+}
+
+func wordSet(s string) map[string]bool {
+	set := map[string]bool{}
+	for _, w := range splitWords(s) {
+		lw := ""
+		for _, r := range w {
+			if r >= 'A' && r <= 'Z' {
+				r = r + ('a' - 'A')
+			}
+			lw += string(r)
+		}
+		if lw != "" {
+			set[lw] = true
+		}
+	}
+	return set
 }
 
 func (c *SemanticCache) Stats() map[string]int {

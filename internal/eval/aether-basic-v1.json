@@ -1,0 +1,60 @@
+{
+  "name": "aether-basic-v1",
+  "description": "Original Aether-authored prompts spanning task categories. Deterministic 'expect_keywords'/'expect_regex' let the offline heuristic scorer measure quality without any paid API. Extend it with your own items.",
+  "license": "CC0-1.0 (original content, no third-party benchmark data)",
+  "items": [
+    {"id": "coding_001", "category": "coding", "prompt": "Write a Go function named reverse that takes a string and returns it reversed, handling multibyte runes correctly.", "expect_keywords": ["func", "reverse", "rune", "return"]},
+    {"id": "coding_002", "category": "coding", "prompt": "In Python, write a function is_palindrome(s) that ignores case and non-alphanumeric characters.", "expect_keywords": ["def", "is_palindrome", "return"]},
+    {"id": "coding_003", "category": "coding", "prompt": "Explain what a nil pointer dereference is in Go and show one line of code that causes it.", "expect_keywords": ["nil", "pointer"]},
+    {"id": "coding_004", "category": "coding", "prompt": "Write a SQL query that returns the top 3 customers by total order amount from tables customers(id,name) and orders(customer_id,amount).", "expect_keywords": ["select", "join", "group by", "limit"]},
+    {"id": "coding_005", "category": "coding", "prompt": "Write a regular expression that matches a valid IPv4 address.", "expect_keywords": ["25", "\\d", "."]},
+    {"id": "coding_006", "category": "coding", "prompt": "Refactor this into a single line: result := []int{}; for _, x := range nums { if x > 0 { result = append(result, x) } }. Explain briefly.", "expect_keywords": ["range", "append"]},
+
+    {"id": "math_001", "category": "math", "prompt": "What is 47 * 23? Answer with the number only.", "expect_keywords": ["1081"]},
+    {"id": "math_002", "category": "math", "prompt": "Solve for x: 3x + 7 = 22. Show the value of x.", "expect_keywords": ["5"]},
+    {"id": "math_003", "category": "math", "prompt": "What is 15% of 240?", "expect_keywords": ["36"]},
+    {"id": "math_004", "category": "math", "prompt": "A train travels 180 km in 2 hours. What is its average speed in km/h?", "expect_keywords": ["90"]},
+    {"id": "math_005", "category": "math", "prompt": "What is the derivative of x^2 + 3x with respect to x?", "expect_keywords": ["2x", "3"]},
+    {"id": "math_006", "category": "math", "prompt": "If a fair coin is flipped 3 times, what is the probability of getting exactly 2 heads? Give the fraction.", "expect_keywords": ["3/8"]},
+
+    {"id": "reasoning_001", "category": "reasoning", "prompt": "All roses are flowers. Some flowers fade quickly. Can we conclude that some roses fade quickly? Answer yes or no and explain in one sentence.", "expect_keywords": ["no"]},
+    {"id": "reasoning_002", "category": "reasoning", "prompt": "If it takes 5 machines 5 minutes to make 5 widgets, how long would 100 machines take to make 100 widgets?", "expect_keywords": ["5"]},
+    {"id": "reasoning_003", "category": "reasoning", "prompt": "A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball. How much does the ball cost?", "expect_keywords": ["0.05", "5 cent"]},
+    {"id": "reasoning_004", "category": "reasoning", "prompt": "Explain why correlation does not imply causation, using one concrete example.", "expect_keywords": ["causation", "correlation"]},
+    {"id": "reasoning_005", "category": "reasoning", "prompt": "You have two ropes that each burn in exactly 60 minutes but not uniformly. How do you measure 45 minutes? Explain the steps.", "expect_keywords": ["both ends", "light"]},
+
+    {"id": "summarization_001", "category": "summarization", "prompt": "Summarize in one sentence: The mitochondrion is a double-membrane-bound organelle found in most eukaryotic cells. It generates most of the cell's supply of ATP, used as chemical energy.", "expect_keywords": ["mitochond", "energy"]},
+    {"id": "summarization_002", "category": "summarization", "prompt": "Give a 3-bullet TL;DR: Aether is a policy compiler and runtime for AI applications. It classifies a task, filters models by policy, and routes to the best-fitting model. It prefers local models to keep costs at zero.", "expect_keywords": ["policy", "route", "local"]},
+    {"id": "summarization_003", "category": "summarization", "prompt": "Condense to under 15 words: Regular exercise improves cardiovascular health, strengthens muscles, boosts mood, and helps regulate sleep patterns.", "expect_keywords": ["exercise"]},
+    {"id": "summarization_004", "category": "summarization", "prompt": "Summarize the key point: Caching stores previous results so repeated identical requests can be served without recomputation, reducing latency and cost.", "expect_keywords": ["cache", "reduce"]},
+
+    {"id": "translation_001", "category": "translation", "prompt": "Translate to French: 'Good morning, how are you?'", "expect_keywords": ["bonjour"]},
+    {"id": "translation_002", "category": "translation", "prompt": "Translate to Spanish: 'Where is the train station?'", "expect_keywords": ["estación", "estacion", "tren"]},
+    {"id": "translation_003", "category": "translation", "prompt": "Translate to German: 'Thank you very much.'", "expect_keywords": ["danke"]},
+    {"id": "translation_004", "category": "translation", "prompt": "Translate to English: 'Je voudrais un café, s'il vous plaît.'", "expect_keywords": ["coffee", "please"]},
+
+    {"id": "classification_001", "category": "classification", "prompt": "Classify the sentiment as positive, negative, or neutral: 'This is the best purchase I have ever made!'", "expect_keywords": ["positive"]},
+    {"id": "classification_002", "category": "classification", "prompt": "Classify the sentiment as positive, negative, or neutral: 'The package arrived broken and support ignored me.'", "expect_keywords": ["negative"]},
+    {"id": "classification_003", "category": "classification", "prompt": "Is this spam? Reply spam or not-spam: 'Congratulations! You won a free iPhone. Click here to claim now!!!'", "expect_keywords": ["spam"]},
+    {"id": "classification_004", "category": "classification", "prompt": "Categorize this support ticket as billing, technical, or account: 'I was charged twice for my subscription this month.'", "expect_keywords": ["billing"]},
+
+    {"id": "extraction_001", "category": "extraction", "prompt": "Extract the email address from: 'Reach me at jane.doe@example.com after 5pm.' Return only the email.", "expect_keywords": ["jane.doe@example.com"]},
+    {"id": "extraction_002", "category": "extraction", "prompt": "Extract all numbers from: 'Order 7 units at $12 each, ships in 3 days.' Return them as a list.", "expect_keywords": ["7", "12", "3"]},
+    {"id": "extraction_003", "category": "extraction", "prompt": "From 'Meeting with Dr. Smith on 2026-03-14 at 9am', extract the date in YYYY-MM-DD form.", "expect_keywords": ["2026-03-14"]},
+    {"id": "extraction_004", "category": "extraction", "prompt": "Return JSON with keys name and role for: 'Alice is the lead engineer.'", "expect_keywords": ["alice", "engineer"]},
+
+    {"id": "rag_001", "category": "rag", "prompt": "Using only this context, answer: what port does the service use? Context: 'The Aether daemon listens on port 8723 by default and can be changed with --port.'", "expect_keywords": ["8723"]},
+    {"id": "rag_002", "category": "rag", "prompt": "Based on the following, who wrote the report? Context: 'The Q3 analysis was authored by Priya Nair and reviewed by the finance team.'", "expect_keywords": ["priya"]},
+    {"id": "rag_003", "category": "rag", "prompt": "According to the document, what is the refund window? Context: 'Customers may request a refund within 30 days of purchase.'", "expect_keywords": ["30"]},
+    {"id": "rag_004", "category": "rag", "prompt": "From the provided passage, list the two supported platforms. Context: 'The CLI ships for macOS and Linux; Windows support is planned.'", "expect_keywords": ["macos", "linux"]},
+
+    {"id": "creative_001", "category": "creative", "prompt": "Write a haiku about the ocean.", "expect_regex": ".{20,}"},
+    {"id": "creative_002", "category": "creative", "prompt": "Invent a two-sentence bedtime story about a sleepy robot.", "expect_keywords": ["robot"]},
+    {"id": "creative_003", "category": "creative", "prompt": "Write a catchy one-line slogan for a free, local-first AI router.", "expect_regex": ".{10,}"},
+
+    {"id": "general_001", "category": "general", "prompt": "What is the capital of France?", "expect_keywords": ["paris"]},
+    {"id": "general_002", "category": "general", "prompt": "List three benefits of drinking water.", "expect_regex": ".{20,}"},
+    {"id": "general_003", "category": "general", "prompt": "Explain what an API is in one sentence a beginner can understand.", "expect_keywords": ["api"]},
+    {"id": "general_004", "category": "general", "prompt": "Name the largest planet in our solar system.", "expect_keywords": ["jupiter"]}
+  ]
+}

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Orbis-Mind/aether/internal/classifier"
 	"github.com/Orbis-Mind/aether/internal/core"
 	"github.com/Orbis-Mind/aether/internal/router"
 	"github.com/Orbis-Mind/aether/internal/yamlx"
@@ -21,19 +22,28 @@ import (
 var aeMagic = []byte("AETHER\x00\x01")
 
 type ValidationError struct{ msg string }
+
 func (e ValidationError) Error() string { return "validation error: " + e.msg }
 
 func ValidateYAML(path string) (*core.AetherSpec, error) {
 	data, err := os.ReadFile(path)
-	if err != nil { return nil, fmt.Errorf("cannot read spec: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("cannot read spec: %w", err)
+	}
 
 	raw, err := yamlx.Unmarshal(data)
-	if err != nil { return nil, fmt.Errorf("invalid YAML: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("invalid YAML: %w", err)
+	}
 
 	name := yamlx.GetString(raw, "name")
 	version := yamlx.GetString(raw, "version")
-	if name == "" { return nil, ValidationError{"field 'name' required"} }
-	if version == "" { return nil, ValidationError{"field 'version' required"} }
+	if name == "" {
+		return nil, ValidationError{"field 'name' required"}
+	}
+	if version == "" {
+		return nil, ValidationError{"field 'version' required"}
+	}
 
 	spec := &core.AetherSpec{
 		Name:        name,
@@ -46,17 +56,7 @@ func ValidateYAML(path string) (*core.AetherSpec, error) {
 	}
 
 	if pm := yamlx.GetMap(raw, "policy"); pm != nil {
-		if v := yamlx.GetFloat(pm, "max_cost_per_run", -1); v >= 0 { spec.Policy.MaxCostPerRun = v }
-		if v := yamlx.GetString(pm, "quality"); v != "" { spec.Policy.Quality = core.QualityLevel(v) }
-		if v := yamlx.GetString(pm, "latency"); v != "" { spec.Policy.Latency = core.LatencyProfile(v) }
-		if v := yamlx.GetInt(pm, "max_retries", -1); v >= 0 { spec.Policy.MaxRetries = v }
-		for _, fb := range yamlx.GetSlice(pm, "fallback_models") {
-			if s, ok := fb.(string); ok { spec.Policy.FallbackModels = append(spec.Policy.FallbackModels, s) }
-		}
-		for _, ap := range yamlx.GetSlice(pm, "allowed_providers") {
-			if s, ok := ap.(string); ok { spec.Policy.AllowedProviders = append(spec.Policy.AllowedProviders, s) }
-		}
-		spec.Policy.PreferLocal = yamlx.GetBool(pm, "prefer_local")
+		parsePolicy(pm, &spec.Policy)
 	}
 
 	if mm := yamlx.GetMap(raw, "memory"); mm != nil {
@@ -64,7 +64,9 @@ func ValidateYAML(path string) (*core.AetherSpec, error) {
 		spec.Memory.LongTerm = yamlx.GetBool(mm, "long_term")
 		spec.Memory.Entity = yamlx.GetBool(mm, "entity")
 		spec.Memory.Relationship = yamlx.GetBool(mm, "relationship")
-		if v := yamlx.GetInt(mm, "ttl_seconds", 0); v > 0 { spec.Memory.TTLSeconds = v }
+		if v := yamlx.GetInt(mm, "ttl_seconds", 0); v > 0 {
+			spec.Memory.TTLSeconds = v
+		}
 	}
 
 	for _, t := range yamlx.GetSlice(raw, "tools") {
@@ -79,11 +81,89 @@ func ValidateYAML(path string) (*core.AetherSpec, error) {
 
 	if pm := yamlx.GetMap(raw, "prompts"); pm != nil {
 		for k, v := range pm {
-			if s, ok := v.(string); ok { spec.Prompts[k] = s }
+			if s, ok := v.(string); ok {
+				spec.Prompts[k] = s
+			}
 		}
 	}
 
 	return spec, nil
+}
+
+// parsePolicy reads a policy block supporting BOTH the original flat form and
+// the nested policy-engine form, so existing specs keep working:
+//
+//	# flat                     # nested
+//	quality: balanced          quality: {minimum: 0.9}
+//	max_cost_per_run: 0.05     cost: {max_per_run: 0.01}
+//	latency: fast              latency: {max_p95: 2000}
+//	prefer_local: true         privacy: {level: local}
+//	                           execution: {local_first: true}
+//	                           fallback: {enabled: true, max_attempts: 2}
+func parsePolicy(pm map[string]interface{}, p *core.Policy) {
+	// Cost.
+	if v := yamlx.GetFloat(pm, "max_cost_per_run", -1); v >= 0 {
+		p.MaxCostPerRun = v
+	}
+	if cm := yamlx.GetMap(pm, "cost"); cm != nil {
+		if v := yamlx.GetFloat(cm, "max_per_run", -1); v >= 0 {
+			p.MaxCostPerRun = v
+		}
+	}
+	// Quality: string tier (flat) or {minimum: float} (nested).
+	if qm := yamlx.GetMap(pm, "quality"); qm != nil {
+		if v := yamlx.GetFloat(qm, "minimum", -1); v >= 0 {
+			p.QualityMinimum = v
+		}
+	} else if v := yamlx.GetString(pm, "quality"); v != "" {
+		p.Quality = core.QualityLevel(v)
+	}
+	// Latency: string profile (flat) or {max_p95: int} (nested).
+	if lm := yamlx.GetMap(pm, "latency"); lm != nil {
+		if v := yamlx.GetInt(lm, "max_p95", 0); v > 0 {
+			p.LatencyMaxP95 = v
+		}
+	} else if v := yamlx.GetString(pm, "latency"); v != "" {
+		p.Latency = core.LatencyProfile(v)
+	}
+	// Privacy.
+	if prm := yamlx.GetMap(pm, "privacy"); prm != nil {
+		if v := yamlx.GetString(prm, "level"); v != "" {
+			p.Privacy = core.PrivacyLevel(v)
+		}
+	}
+	// Execution.
+	if em := yamlx.GetMap(pm, "execution"); em != nil {
+		p.LocalFirst = yamlx.GetBool(em, "local_first")
+	}
+	// Fallback: nested block or flat toggles.
+	if fm := yamlx.GetMap(pm, "fallback"); fm != nil {
+		p.FallbackEnabled = yamlx.GetBool(fm, "enabled")
+		if v := yamlx.GetInt(fm, "max_attempts", 0); v > 0 {
+			p.FallbackMaxAttempts = v
+		}
+	}
+	// Strategy (may be pinned in-spec; usually set via CLI).
+	if v := yamlx.GetString(pm, "strategy"); v != "" {
+		p.Strategy = core.Strategy(v)
+	}
+	// Retries + provider controls (flat).
+	if v := yamlx.GetInt(pm, "max_retries", -1); v >= 0 {
+		p.MaxRetries = v
+	}
+	for _, fb := range yamlx.GetSlice(pm, "fallback_models") {
+		if s, ok := fb.(string); ok {
+			p.FallbackModels = append(p.FallbackModels, s)
+		}
+	}
+	for _, ap := range yamlx.GetSlice(pm, "allowed_providers") {
+		if s, ok := ap.(string); ok {
+			p.AllowedProviders = append(p.AllowedProviders, s)
+		}
+	}
+	if yamlx.GetBool(pm, "prefer_local") {
+		p.PreferLocal = true
+	}
 }
 
 var (
@@ -99,23 +179,6 @@ func compressPrompt(text string) (string, int, int) {
 	p = fillerPhrases.ReplaceAllString(p, "")
 	p = strings.TrimSpace(p)
 	return p, orig, core.EstimateTokens(p)
-}
-
-var (
-	expertKW  = []string{"synthesize","compare","evaluate","critique","strategy","design","architect","research","analyze","reason"}
-	complexKW = []string{"explain","summarize","describe","generate","write","create","build","implement","solve","debug"}
-	simpleKW  = []string{"list","extract","format","convert","translate","classify","label","tag"}
-	trivialKW = []string{"check","validate","count","find","lookup","get","fetch"}
-)
-
-func analyzeComplexity(system, user string, tools []core.ToolDefinition) core.TaskComplexity {
-	combined := strings.ToLower(system + " " + user)
-	for _, kw := range expertKW { if strings.Contains(combined, kw) { return core.ComplexityExpert } }
-	if len(tools) > 0 { return core.ComplexityComplex }
-	for _, kw := range complexKW { if strings.Contains(combined, kw) { return core.ComplexityComplex } }
-	for _, kw := range simpleKW { if strings.Contains(combined, kw) { return core.ComplexitySimple } }
-	for _, kw := range trivialKW { if strings.Contains(combined, kw) { return core.ComplexityTrivial } }
-	return core.ComplexityModerate
 }
 
 var outTokens = map[core.TaskComplexity]int{
@@ -134,50 +197,87 @@ func Compile(spec *core.AetherSpec, outputDir string, verbose bool) (*CompileRes
 	t0 := time.Now()
 
 	system := spec.Prompts["system"]
-	if system == "" { system = "You are a helpful AI assistant." }
+	if system == "" {
+		system = "You are a helpful AI assistant."
+	}
 	user := spec.Prompts["user_template"]
-	if user == "" { user = "{user_message}" }
+	if user == "" {
+		user = "{user_message}"
+	}
 
 	sysOpt, sysOrig, sysOptTok := compressPrompt(system)
 	usrOpt, usrOrig, usrOptTok := compressPrompt(user)
 	tokensSaved := (sysOrig + usrOrig) - (sysOptTok + usrOptTok)
 
-	complexity := analyzeComplexity(system, user, spec.Tools)
+	// Classify the workload, then route it through the intelligent pipeline
+	// (task analysis → policy filtering → capability/quality/cost/latency
+	// scoring → selection). Availability is a runtime fact, so compile-time
+	// routing passes nil and pins a policy-satisfying default; `aether run` can
+	// re-route against installed local models.
+	analysis := classifier.New().Classify(system, user, len(spec.Tools) > 0)
+	complexity := analysis.Complexity()
 	estIn := sysOptTok + usrOptTok
 	estOut := outTokens[complexity]
 
-	r := router.New()
-	selectedModel, err := r.Select(complexity, spec.Policy, estIn, estOut)
-	if err != nil { return nil, fmt.Errorf("router: %w", err) }
+	strategy := spec.Policy.Strategy
+	if strategy == "" {
+		strategy = core.StrategyAuto
+	}
+	decision, err := router.NewPipeline().Route(analysis, spec.Policy, strategy, estIn, estOut, nil)
+	if err != nil {
+		return nil, fmt.Errorf("router: %w", err)
+	}
+	selectedModel := decision.Chosen
 
 	mSpec := core.ModelCatalogue[selectedModel]
 	retrieval := "none"
-	if spec.Memory.Semantic { retrieval = "semantic" }
+	if spec.Memory.Semantic {
+		retrieval = "semantic"
+	}
 	cacheStrat := "semantic"
-	if complexity == core.ComplexityComplex || complexity == core.ComplexityExpert { cacheStrat = "exact" }
+	if complexity == core.ComplexityComplex || complexity == core.ComplexityExpert {
+		cacheStrat = "exact"
+	}
 
 	plan := core.NewExecutionPlan()
-	plan.SpecName = spec.Name; plan.SpecVersion = spec.Version
+	plan.SpecName = spec.Name
+	plan.SpecVersion = spec.Version
 	plan.SelectedModel = selectedModel
-	plan.EstimatedInputTokens = estIn; plan.EstimatedOutputTokens = estOut
+	plan.EstimatedInputTokens = estIn
+	plan.EstimatedOutputTokens = estOut
 	plan.EstimatedCost = mSpec.CostEstimate(estIn, estOut)
-	plan.OptimizedSystemPrompt = sysOpt; plan.OptimizedUserTemplate = usrOpt
-	plan.RetrievalStrategy = retrieval; plan.CacheStrategy = cacheStrat
+	plan.OptimizedSystemPrompt = sysOpt
+	plan.OptimizedUserTemplate = usrOpt
+	plan.RetrievalStrategy = retrieval
+	plan.CacheStrategy = cacheStrat
 	plan.Complexity = complexity
+	plan.Strategy = strategy
+	plan.TaskType = string(analysis.Type)
+	plan.Difficulty = analysis.Difficulty
+	plan.Risk = string(analysis.Risk)
+	plan.RoutingReason = decision.Reason
 
 	var steps []core.ExecutionStep
-	if retrieval != "none" { steps = append(steps, core.ExecutionStep{Step: "retrieve_context", Strategy: retrieval}) }
+	if retrieval != "none" {
+		steps = append(steps, core.ExecutionStep{Step: "retrieve_context", Strategy: retrieval})
+	}
 	steps = append(steps, core.ExecutionStep{Step: "inject_memory"})
 	steps = append(steps, core.ExecutionStep{Step: "render_prompt"})
 	toolNames := make([]string, len(spec.Tools))
-	for i, t := range spec.Tools { toolNames[i] = t.Name }
+	for i, t := range spec.Tools {
+		toolNames[i] = t.Name
+	}
 	steps = append(steps, core.ExecutionStep{Step: "execute_model", Tools: toolNames})
-	if spec.Memory.LongTerm { steps = append(steps, core.ExecutionStep{Step: "store_memory"}) }
+	if spec.Memory.LongTerm {
+		steps = append(steps, core.ExecutionStep{Step: "store_memory"})
+	}
 	steps = append(steps, core.ExecutionStep{Step: "cache_response"})
 	plan.ExecutionSteps = steps
 
 	artifactPath := fmt.Sprintf("%s/%s-%s.ae", outputDir, spec.Name, spec.Version)
-	if err := writeAE(spec, &plan, artifactPath); err != nil { return nil, err }
+	if err := writeAE(spec, &plan, artifactPath); err != nil {
+		return nil, err
+	}
 
 	elapsed := time.Since(t0).Milliseconds()
 	if verbose {
@@ -192,14 +292,20 @@ func writeAE(spec *core.AetherSpec, plan *core.ExecutionPlan, path string) error
 
 	writeJSON := func(name string, v interface{}) error {
 		w, err := zw.Create(name)
-		if err != nil { return err }
-		enc := json.NewEncoder(w); enc.SetIndent("", "  ")
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
 		return enc.Encode(v)
 	}
 	writeText := func(name, text string) error {
 		w, err := zw.Create(name)
-		if err != nil { return err }
-		_, err = w.Write([]byte(text)); return err
+		if err != nil {
+			return err
+		}
+		_, err = w.Write([]byte(text))
+		return err
 	}
 
 	manifest := map[string]interface{}{
@@ -220,13 +326,17 @@ func writeAE(spec *core.AetherSpec, plan *core.ExecutionPlan, path string) error
 	sum := sha256.Sum256(payload)
 
 	f, err := os.Create(path)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer f.Close()
 
 	f.Write(aeMagic)
 	sizeBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(sizeBuf, uint32(len(payload)))
-	f.Write(sizeBuf); f.Write(sum[:4]); f.Write(payload)
+	f.Write(sizeBuf)
+	f.Write(sum[:4])
+	f.Write(payload)
 	return nil
 }
 
@@ -240,19 +350,28 @@ type ArtifactContents struct {
 
 func ReadAEArtifact(path string) (*ArtifactContents, error) {
 	data, err := os.ReadFile(path)
-	if err != nil { return nil, fmt.Errorf("cannot read artifact: %w", err) }
-	if len(data) < 16 { return nil, fmt.Errorf("artifact too small") }
-	if !bytes.Equal(data[:8], aeMagic) { return nil, fmt.Errorf("invalid .ae artifact") }
+	if err != nil {
+		return nil, fmt.Errorf("cannot read artifact: %w", err)
+	}
+	if len(data) < 16 {
+		return nil, fmt.Errorf("artifact too small")
+	}
+	if !bytes.Equal(data[:8], aeMagic) {
+		return nil, fmt.Errorf("invalid .ae artifact")
+	}
 	size := binary.BigEndian.Uint32(data[8:12])
 	payload := data[16 : 16+size]
 
 	zr, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
-	if err != nil { return nil, fmt.Errorf("cannot open artifact zip: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("cannot open artifact zip: %w", err)
+	}
 
 	readFile := func(name string) ([]byte, error) {
 		for _, f := range zr.File {
 			if f.Name == name {
-				rc, _ := f.Open(); defer rc.Close()
+				rc, _ := f.Open()
+				defer rc.Close()
 				return io.ReadAll(rc)
 			}
 		}
@@ -260,10 +379,15 @@ func ReadAEArtifact(path string) (*ArtifactContents, error) {
 	}
 
 	ac := &ArtifactContents{}
-	manifestData, _ := readFile("manifest.json"); json.Unmarshal(manifestData, &ac.Manifest)
-	specData, _ := readFile("spec.json"); json.Unmarshal(specData, &ac.Spec)
-	planData, _ := readFile("plan.json"); json.Unmarshal(planData, &ac.Plan)
-	sys, _ := readFile("prompts/system.txt"); ac.SystemPrompt = string(sys)
-	usr, _ := readFile("prompts/user_template.txt"); ac.UserTemplate = string(usr)
+	manifestData, _ := readFile("manifest.json")
+	json.Unmarshal(manifestData, &ac.Manifest)
+	specData, _ := readFile("spec.json")
+	json.Unmarshal(specData, &ac.Spec)
+	planData, _ := readFile("plan.json")
+	json.Unmarshal(planData, &ac.Plan)
+	sys, _ := readFile("prompts/system.txt")
+	ac.SystemPrompt = string(sys)
+	usr, _ := readFile("prompts/user_template.txt")
+	ac.UserTemplate = string(usr)
 	return ac, nil
 }

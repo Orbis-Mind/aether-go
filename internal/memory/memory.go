@@ -26,7 +26,7 @@ func embed(text string) []float64 {
 		for n := 1; n <= min(len(w), 4); n++ {
 			ngram := w[:n]
 			h := md5.Sum([]byte(ngram))
-			idx := int(h[0])%embeddingDim
+			idx := int(h[0]) % embeddingDim
 			vec[idx] += 1.0
 		}
 	}

@@ -9,8 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Orbis-Mind/aether/internal/classifier"
 	"github.com/Orbis-Mind/aether/internal/compiler"
 	"github.com/Orbis-Mind/aether/internal/core"
+	"github.com/Orbis-Mind/aether/internal/models"
 	"github.com/Orbis-Mind/aether/internal/observability"
 	"github.com/Orbis-Mind/aether/internal/registry"
 	"github.com/Orbis-Mind/aether/internal/router"
@@ -20,11 +22,11 @@ import (
 const version = "0.1.0"
 
 // ─── Color helpers (ANSI, work on Windows 10+ terminal) ───────────────────
-func cyan(s string) string  { return "\033[36;1m" + s + "\033[0m" }
-func green(s string) string { return "\033[32m" + s + "\033[0m" }
+func cyan(s string) string   { return "\033[36;1m" + s + "\033[0m" }
+func green(s string) string  { return "\033[32m" + s + "\033[0m" }
 func yellow(s string) string { return "\033[33m" + s + "\033[0m" }
-func red(s string) string   { return "\033[31m" + s + "\033[0m" }
-func bold(s string) string  { return "\033[1m" + s + "\033[0m" }
+func red(s string) string    { return "\033[31m" + s + "\033[0m" }
+func bold(s string) string   { return "\033[1m" + s + "\033[0m" }
 
 func banner() {
 	fmt.Println(cyan(`
@@ -41,24 +43,34 @@ func fail(msg string) { fmt.Fprintln(os.Stderr, red("  ✗ "+msg)) }
 
 func findSpec(path string) (string, error) {
 	if path != "" {
-		if _, err := os.Stat(path); err == nil { return path, nil }
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
 		return "", fmt.Errorf("spec file not found: %s", path)
 	}
 	for _, n := range []string{"agent.ae.yaml", "agent.ae.yml"} {
-		if _, err := os.Stat(n); err == nil { return n, nil }
+		if _, err := os.Stat(n); err == nil {
+			return n, nil
+		}
 	}
 	matches, _ := filepath.Glob("*.ae.yaml")
-	if len(matches) > 0 { return matches[0], nil }
+	if len(matches) > 0 {
+		return matches[0], nil
+	}
 	return "", fmt.Errorf("no .ae.yaml spec found — run 'aether init' first")
 }
 
 func findArtifact(path string) (string, error) {
 	if path != "" {
-		if _, err := os.Stat(path); err == nil { return path, nil }
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
 		return "", fmt.Errorf("artifact not found: %s", path)
 	}
 	matches, _ := filepath.Glob("*.ae")
-	if len(matches) > 0 { return matches[0], nil }
+	if len(matches) > 0 {
+		return matches[0], nil
+	}
 	return "", fmt.Errorf("no .ae artifact found — run 'aether build' first")
 }
 
@@ -96,26 +108,42 @@ func cmdInit(args []string) {
 
 	banner()
 	name := "my-agent"
-	if len(positional) > 0 { name = positional[0] }
-	dest := *dir; if dest == "" { dest = name }
+	if len(positional) > 0 {
+		name = positional[0]
+	}
+	dest := *dir
+	if dest == "" {
+		dest = name
+	}
 	os.MkdirAll(dest, 0755)
 
 	template := "name: " + name + `
 version: "1.0.0"
 description: "A new Aether AI agent"
 
+# Aether picks the model, execution strategy, and fallback path from this
+# policy. It is free-first: with Ollama running, ` + "`aether run`" + ` prefers an
+# installed local model automatically ($0, private). No API key required.
 policy:
+  # Flat form (simple):
   max_cost_per_run: 0.05
-  quality: balanced
-  latency: balanced
+  quality: balanced        # draft | balanced | high | expert
+  latency: balanced        # realtime | fast | balanced | batch
   max_retries: 3
-  # Run fully local & free via Ollama (no API key needed).
-  # Uncomment, then: ollama serve && ollama pull llama3.2
-  # prefer_local: true
-  # Or pin specific providers, e.g. [ollama] or [openai, anthropic]:
-  # allowed_providers: [ollama]
+
+  # Nested policy-engine form is also supported, e.g.:
+  #   quality:   { minimum: 0.80 }   # absolute quality floor 0..1
+  #   cost:      { max_per_run: 0.01 }
+  #   latency:   { max_p95: 2000 }
+  #   privacy:   { level: local }    # HARD guarantee: never calls cloud
+  #   execution: { local_first: true }
+  #   fallback:  { enabled: true, max_attempts: 2 }
+
+  # Force a $0, fully-private path (cloud can never be selected):
+  # privacy:
+  #   level: local
   # Tried in order if the primary model fails:
-  # fallback_models: [llama3.2, gpt-4o-mini]
+  # fallback_models: [llama3.2]
 
 memory:
   semantic: true
@@ -136,7 +164,7 @@ prompts:
 `
 	specPath := filepath.Join(dest, "agent.ae.yaml")
 	os.WriteFile(specPath, []byte(template), 0644)
-	for _, sub := range []string{"cache","memory","observability","artifacts"} {
+	for _, sub := range []string{"cache", "memory", "observability", "artifacts"} {
 		os.MkdirAll(filepath.Join(dest, ".aether", sub), 0755)
 	}
 	os.WriteFile(filepath.Join(dest, ".aether", ".gitignore"), []byte("*\n!.gitignore\n"), 0644)
@@ -150,22 +178,34 @@ prompts:
 // ─── build ────────────────────────────────────────────────────────────────
 func cmdBuild(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
-	output  := fs.String("output", ".", "output directory")
+	output := fs.String("output", ".", "output directory")
 	verbose := fs.Bool("verbose", false, "verbose output")
 	fs.Parse(args)
 
 	banner()
-	specPath := ""; if fs.NArg() > 0 { specPath = fs.Arg(0) }
+	specPath := ""
+	if fs.NArg() > 0 {
+		specPath = fs.Arg(0)
+	}
 	p, err := findSpec(specPath)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 	info("Compiling " + p + " ...")
 
 	spec, err := compiler.ValidateYAML(p)
-	if err != nil { fail("Validation: " + err.Error()); os.Exit(1) }
+	if err != nil {
+		fail("Validation: " + err.Error())
+		os.Exit(1)
+	}
 
 	os.MkdirAll(*output, 0755)
 	result, err := compiler.Compile(spec, *output, *verbose)
-	if err != nil { fail("Compilation: " + err.Error()); os.Exit(1) }
+	if err != nil {
+		fail("Compilation: " + err.Error())
+		os.Exit(1)
+	}
 
 	ok(fmt.Sprintf("Compiled in %dms", result.ElapsedMS))
 	ok("Artifact: " + result.ArtifactPath)
@@ -184,35 +224,85 @@ func cmdBuild(args []string) {
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	message := fs.String("message", "", "user message")
-	mock    := fs.Bool("mock", false, "force mock model")
+	mock := fs.Bool("mock", false, "force mock model")
 	jsonOut := fs.Bool("json", false, "output raw JSON")
-	fs.Parse(args)
+	strategy := fs.String("strategy", "", "routing strategy: auto|cheapest|fastest|best|balanced|local")
+	local := fs.Bool("local", false, "force local-only execution (never calls cloud)")
+	stream := fs.Bool("stream", false, "stream the response as it is generated")
+	flags, positional := splitArgs(args)
+	fs.Parse(flags)
 
-	if !*jsonOut { banner() }
+	if !*jsonOut {
+		banner()
+	}
 
-	artifactPath := ""; if fs.NArg() > 0 { artifactPath = fs.Arg(0) }
+	artifactPath := ""
+	if len(positional) > 0 {
+		artifactPath = positional[0]
+	}
 	p, err := findArtifact(artifactPath)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 	info("Loading artifact: " + p)
 
 	ac, err := compiler.ReadAEArtifact(p)
-	if err != nil { fail("Cannot read artifact: " + err.Error()); os.Exit(1) }
+	if err != nil {
+		fail("Cannot read artifact: " + err.Error())
+		os.Exit(1)
+	}
 
 	ac.Plan.OptimizedSystemPrompt = ac.SystemPrompt
 	ac.Plan.OptimizedUserTemplate = ac.UserTemplate
-	if *mock { ac.Plan.SelectedModel = "mock"; warn("Using mock model (no API call will be made)") }
 
 	if *message == "" {
 		fmt.Print("  Message: ")
 		fmt.Scanln(message)
 	}
 
+	// Load measured overlays so any re-routing uses real quality data.
+	models.LoadMeasured(dataDir() + "/observability/benchmarks.json")
+
+	switch {
+	case *mock:
+		ac.Plan.SelectedModel = "mock"
+		warn("Using mock model (no API call will be made)")
+	default:
+		// Intelligent, free-first re-routing at run time.
+		chosen, note := rerouteForRun(ac, *message, *strategy, *local)
+		ac.Plan.SelectedModel = chosen
+		if note != "" && !*jsonOut {
+			info(note)
+		}
+	}
+
 	rt := runtime.New(&ac.Spec, &ac.Plan, dataDir())
+
+	if *stream && !*jsonOut {
+		info("Streaming from " + ac.Plan.SelectedModel + "...")
+		fmt.Println(cyan("  ─── Response ─────────────────────────────") + "\n")
+		result := rt.RunStream(*message, nil, os.Stdout)
+		fmt.Println()
+		if !result.Success {
+			fail("Execution failed: " + result.Error)
+			os.Exit(1)
+		}
+		fmt.Println("\n" + cyan("  ─── Metadata ─────────────────────────────"))
+		fmt.Printf("    Model    : %s\n", result.ModelUsed)
+		fmt.Printf("    Tokens   : %d in / %d out\n", result.InputTokens, result.OutputTokens)
+		fmt.Printf("    Latency  : %.0fms\n", result.LatencyMS)
+		return
+	}
+
 	info("Executing...")
 	result := rt.Run(*message, nil)
 
 	if *jsonOut {
-		enc := json.NewEncoder(os.Stdout); enc.SetIndent("", "  "); enc.Encode(result); return
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(result)
+		return
 	}
 	fmt.Println()
 	if result.Success {
@@ -226,32 +316,60 @@ func cmdRun(args []string) {
 		fmt.Printf("    Cached   : %v\n", result.Cached)
 		fmt.Printf("    Run ID   : %s\n", result.RunID)
 	} else {
-		fail("Execution failed: " + result.Error); os.Exit(1)
+		fail("Execution failed: " + result.Error)
+		os.Exit(1)
 	}
 }
 
 // ─── test ─────────────────────────────────────────────────────────────────
 func cmdTest(args []string) {
-	fs := flag.NewFlagSet("test", flag.ExitOnError); fs.Parse(args)
+	fs := flag.NewFlagSet("test", flag.ExitOnError)
+	fs.Parse(args)
 	banner()
-	specPath := ""; if fs.NArg() > 0 { specPath = fs.Arg(0) }
+	specPath := ""
+	if fs.NArg() > 0 {
+		specPath = fs.Arg(0)
+	}
 	p, err := findSpec(specPath)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 	info("Testing " + p + " ...")
 
 	spec, err := compiler.ValidateYAML(p)
-	if err != nil { fail("Validation failed: " + err.Error()); os.Exit(1) }
+	if err != nil {
+		fail("Validation failed: " + err.Error())
+		os.Exit(1)
+	}
 	ok("YAML validation passed")
 
-	tmp, _ := os.MkdirTemp("", "aether-test-*"); defer os.RemoveAll(tmp)
+	tmp, _ := os.MkdirTemp("", "aether-test-*")
+	defer os.RemoveAll(tmp)
 	result, err := compiler.Compile(spec, tmp, false)
-	if err != nil { fail("Compilation failed: " + err.Error()); os.Exit(1) }
+	if err != nil {
+		fail("Compilation failed: " + err.Error())
+		os.Exit(1)
+	}
 	ok(fmt.Sprintf("Compilation passed  (model: %s, complexity: %s)", result.Plan.SelectedModel, result.Plan.Complexity))
 
-	r := router.New()
+	// Show the full intelligent-routing decision (task analysis → policy →
+	// candidates → selection), using measured quality overlays when present.
+	models.LoadMeasured(dataDir() + "/observability/benchmarks.json")
+	analysis := classifier.New().Classify(spec.Prompts["system"], spec.Prompts["user_template"], len(spec.Tools) > 0)
+	strat := spec.Policy.Strategy
+	if strat == "" {
+		strat = core.StrategyAuto
+	}
+	dec, derr := router.NewPipeline().Route(analysis, spec.Policy, strat,
+		result.Plan.EstimatedInputTokens, result.Plan.EstimatedOutputTokens, nil)
 	fmt.Println()
-	fmt.Println(r.Explain(result.Plan.Complexity, spec.Policy, result.Plan.EstimatedInputTokens, result.Plan.EstimatedOutputTokens))
-	fmt.Println(); ok("All tests passed")
+	if derr != nil {
+		warn(derr.Error())
+	} else {
+		fmt.Println(router.ExplainDecision(dec))
+	}
+	ok("All tests passed")
 }
 
 // ─── benchmark ────────────────────────────────────────────────────────────
@@ -261,22 +379,33 @@ func cmdBenchmark(args []string) {
 	fs.Parse(args)
 	banner()
 
-	artifactPath := ""; if fs.NArg() > 0 { artifactPath = fs.Arg(0) }
+	artifactPath := ""
+	if fs.NArg() > 0 {
+		artifactPath = fs.Arg(0)
+	}
 	p, err := findArtifact(artifactPath)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 	info(fmt.Sprintf("Benchmarking %s (%d runs) ...", p, *runs))
 
 	ac, err := compiler.ReadAEArtifact(p)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 	ac.Plan.OptimizedSystemPrompt = ac.SystemPrompt
 	ac.Plan.OptimizedUserTemplate = ac.UserTemplate
-	ac.Plan.SelectedModel = "mock"; ac.Plan.CacheStrategy = "none"
+	ac.Plan.SelectedModel = "mock"
+	ac.Plan.CacheStrategy = "none"
 
 	messages := []string{
 		"What is the capital of France?", "Explain quantum computing briefly.",
 		"List 3 benefits of exercise.", "Write a haiku about the ocean.", "What is 42 * 17?",
 	}
-	tmp, _ := os.MkdirTemp("", "aether-bench-*"); defer os.RemoveAll(tmp)
+	tmp, _ := os.MkdirTemp("", "aether-bench-*")
+	defer os.RemoveAll(tmp)
 	rt := runtime.New(&ac.Spec, &ac.Plan, tmp)
 
 	var latencies, costs []float64
@@ -287,7 +416,9 @@ func cmdBenchmark(args []string) {
 		r := rt.Run(msg, nil)
 		latencies = append(latencies, r.LatencyMS)
 		costs = append(costs, r.Cost)
-		if r.Success { successes++ }
+		if r.Success {
+			successes++
+		}
 	}
 
 	fmt.Println("\n" + bold("  Benchmark Results"))
@@ -309,24 +440,38 @@ func cmdPublish(args []string) {
 	fs.Parse(args)
 	banner()
 
-	artifactPath := ""; if fs.NArg() > 0 { artifactPath = fs.Arg(0) }
+	artifactPath := ""
+	if fs.NArg() > 0 {
+		artifactPath = fs.Arg(0)
+	}
 	p, err := findArtifact(artifactPath)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 
 	ac, err := compiler.ReadAEArtifact(p)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 
 	name := fmt.Sprintf("%v", ac.Manifest["name"])
-	ver  := fmt.Sprintf("%v", ac.Manifest["version"])
+	ver := fmt.Sprintf("%v", ac.Manifest["version"])
 	desc := fmt.Sprintf("%v", ac.Manifest["description"])
 	info(fmt.Sprintf("Publishing %s v%s ...", name, ver))
 
 	var tags []string
-	if *tagsStr != "" { tags = strings.Split(*tagsStr, ",") }
+	if *tagsStr != "" {
+		tags = strings.Split(*tagsStr, ",")
+	}
 
 	reg := registry.New("")
 	entry, err := reg.Publish(p, name, ver, desc, *author, tags)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 
 	ok(fmt.Sprintf("Published: %s@%s", entry.Name, entry.Version))
 	ok(fmt.Sprintf("Checksum : %s...", entry.Checksum[:16]))
@@ -338,32 +483,48 @@ func cmdPublish(args []string) {
 // ─── pull ─────────────────────────────────────────────────────────────────
 func cmdPull(args []string) {
 	fs := flag.NewFlagSet("pull", flag.ExitOnError)
-	ver    := fs.String("version", "", "specific version")
+	ver := fs.String("version", "", "specific version")
 	output := fs.String("output", ".", "output directory")
 	fs.Parse(args)
 	banner()
-	if fs.NArg() == 0 { fail("Usage: aether pull <package-name>"); os.Exit(1) }
+	if fs.NArg() == 0 {
+		fail("Usage: aether pull <package-name>")
+		os.Exit(1)
+	}
 
 	name := fs.Arg(0)
 	info(fmt.Sprintf("Pulling %s ...", name))
 	reg := registry.New("")
 	dest, err := reg.Pull(name, *ver, *output)
-	if err != nil { fail(err.Error()); os.Exit(1) }
+	if err != nil {
+		fail(err.Error())
+		os.Exit(1)
+	}
 	ok("Downloaded: " + dest)
 }
 
 // ─── search ───────────────────────────────────────────────────────────────
 func cmdSearch(args []string) {
-	fs := flag.NewFlagSet("search", flag.ExitOnError); fs.Parse(args)
+	fs := flag.NewFlagSet("search", flag.ExitOnError)
+	fs.Parse(args)
 	banner()
-	query := ""; if fs.NArg() > 0 { query = fs.Arg(0) }
+	query := ""
+	if fs.NArg() > 0 {
+		query = fs.Arg(0)
+	}
 	reg := registry.New("")
 	results := reg.Search(query, nil)
-	if len(results) == 0 { warn("No packages found."); return }
+	if len(results) == 0 {
+		warn("No packages found.")
+		return
+	}
 	fmt.Printf("  %-30s %-12s %10s  %s\n", "Package", "Version", "Downloads", "Description")
 	fmt.Println("  " + strings.Repeat("-", 70))
 	for _, e := range results {
-		desc := e.Description; if len(desc) > 30 { desc = desc[:30] }
+		desc := e.Description
+		if len(desc) > 30 {
+			desc = desc[:30]
+		}
 		fmt.Printf("  %-30s %-12s %10d  %s\n", e.Name, e.Version, e.Downloads, desc)
 	}
 }
@@ -378,7 +539,9 @@ func cmdStats(args []string) {
 		fmt.Println("  Recent Runs:")
 		for _, r := range recent {
 			status := green("✓")
-			if !r.Success { status = red("✗") }
+			if !r.Success {
+				status = red("✗")
+			}
 			fmt.Printf("    %s %s  %-25s %s  %.0fms\n",
 				status, r.RunID, r.ModelUsed, core.FormatCost(r.Cost), r.LatencyMS)
 		}
@@ -387,19 +550,52 @@ func cmdStats(args []string) {
 
 // ─── Math helpers ─────────────────────────────────────────────────────────
 func avgF(s []float64) float64 {
-	if len(s) == 0 { return 0 }
-	t := 0.0; for _, v := range s { t += v }; return t / float64(len(s))
+	if len(s) == 0 {
+		return 0
+	}
+	t := 0.0
+	for _, v := range s {
+		t += v
+	}
+	return t / float64(len(s))
 }
-func sumF(s []float64) float64 { t := 0.0; for _, v := range s { t += v }; return t }
+func sumF(s []float64) float64 {
+	t := 0.0
+	for _, v := range s {
+		t += v
+	}
+	return t
+}
 func minF(s []float64) float64 {
-	if len(s) == 0 { return 0 }
-	m := s[0]; for _, v := range s[1:] { if v < m { m = v } }; return m
+	if len(s) == 0 {
+		return 0
+	}
+	m := s[0]
+	for _, v := range s[1:] {
+		if v < m {
+			m = v
+		}
+	}
+	return m
 }
 func maxF(s []float64) float64 {
-	if len(s) == 0 { return 0 }
-	m := s[0]; for _, v := range s[1:] { if v > m { m = v } }; return m
+	if len(s) == 0 {
+		return 0
+	}
+	m := s[0]
+	for _, v := range s[1:] {
+		if v > m {
+			m = v
+		}
+	}
+	return m
 }
-func trunc(s string, n int) string { if len(s) <= n { return s }; return s[:n] }
+func trunc(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
 
 // ─── Help ─────────────────────────────────────────────────────────────────
 func printHelp() {
@@ -414,20 +610,29 @@ func printHelp() {
   Commands:
     init        Initialize a new Aether project
     build       Compile .ae.yaml spec into .ae artifact
-    run         Execute an .ae artifact
-    test        Validate spec and run routing analysis
-    benchmark   Benchmark cost, latency, quality
-    publish     Publish artifact to Aether Registry
-    pull        Pull package from Aether Registry
-    search      Search the Aether Registry
+    run         Execute an .ae artifact (free-first: prefers local models)
+    test        Validate spec and show the intelligent routing decision
+    models      List local (Ollama) + catalogue models with quality provenance
+    doctor      Check environment (Go, Ollama, models, permissions) + fixes
+    evaluate    Benchmark models on a dataset offline (measures real quality)
+    inspect     Show a compiled .ae artifact's plan and routing
+    benchmark   Benchmark runtime cost, latency, quality
+    publish     Publish artifact to local Aether Registry
+    pull        Pull package from local Aether Registry
+    search      Search the local Aether Registry
     stats       Show observability report
 
+  Routing strategies (aether run --strategy ...):
+    auto  cheapest  fastest  best  balanced  local
+
   Examples:
-    aether init my-agent
+    aether init my-agent && cd my-agent
     aether build
-    aether run --mock --message "Hello"
-    aether benchmark --runs 10
-    aether stats
+    aether doctor
+    aether run --local --message "Hello"
+    aether run --strategy cheapest --stream --message "Explain caching"
+    aether evaluate                 # offline model benchmark
+    aether models
 
   Run 'aether <command> --help' for command-specific options.
   Version: ` + version + "\n\n")
@@ -438,22 +643,40 @@ func main() {
 	_ = time.Now() // keep import
 
 	if len(os.Args) < 2 {
-		printHelp(); return
+		printHelp()
+		return
 	}
 
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
 	switch cmd {
-	case "init":      cmdInit(args)
-	case "build":     cmdBuild(args)
-	case "run":       cmdRun(args)
-	case "test":      cmdTest(args)
-	case "benchmark": cmdBenchmark(args)
-	case "publish":   cmdPublish(args)
-	case "pull":      cmdPull(args)
-	case "search":    cmdSearch(args)
-	case "stats":     cmdStats(args)
+	case "init":
+		cmdInit(args)
+	case "build":
+		cmdBuild(args)
+	case "run":
+		cmdRun(args)
+	case "test":
+		cmdTest(args)
+	case "models":
+		cmdModels(args)
+	case "doctor":
+		cmdDoctor(args)
+	case "evaluate", "eval":
+		cmdEvaluate(args)
+	case "inspect":
+		cmdInspect(args)
+	case "benchmark":
+		cmdBenchmark(args)
+	case "publish":
+		cmdPublish(args)
+	case "pull":
+		cmdPull(args)
+	case "search":
+		cmdSearch(args)
+	case "stats":
+		cmdStats(args)
 	case "--version", "-v", "version":
 		fmt.Println("aether version " + version)
 	case "--help", "-h", "help":

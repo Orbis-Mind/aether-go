@@ -7,6 +7,7 @@ import (
 )
 
 type TaskComplexity string
+
 const (
 	ComplexityTrivial  TaskComplexity = "trivial"
 	ComplexitySimple   TaskComplexity = "simple"
@@ -16,6 +17,7 @@ const (
 )
 
 type QualityLevel string
+
 const (
 	QualityDraft    QualityLevel = "draft"
 	QualityBalanced QualityLevel = "balanced"
@@ -24,6 +26,7 @@ const (
 )
 
 type LatencyProfile string
+
 const (
 	LatencyRealtime LatencyProfile = "realtime"
 	LatencyFast     LatencyProfile = "fast"
@@ -32,6 +35,7 @@ const (
 )
 
 type ModelProvider string
+
 const (
 	ProviderAnthropic ModelProvider = "anthropic"
 	ProviderOpenAI    ModelProvider = "openai"
@@ -50,7 +54,7 @@ type ModelSpec struct {
 	SupportsTools      bool
 	// ApproxDiskGB is the rough on-disk footprint of a local (Ollama) model,
 	// shown so users can trade quality against storage. Zero for hosted APIs.
-	ApproxDiskGB       float64
+	ApproxDiskGB float64
 }
 
 // IsLocal reports whether the model runs locally (no network/API key, zero cost).
@@ -127,6 +131,29 @@ var ModelCatalogue = map[string]ModelSpec{
 	},
 }
 
+// PrivacyLevel controls whether prompt data may leave the machine.
+type PrivacyLevel string
+
+const (
+	// PrivacyLocal forbids any cloud provider — a hard guarantee, enforced by
+	// the policy engine, that prompts never leave the machine.
+	PrivacyLocal PrivacyLevel = "local"
+	// PrivacyCloudOK allows cloud providers when otherwise permitted.
+	PrivacyCloudOK PrivacyLevel = "cloud_ok"
+)
+
+// Strategy names the routing objective. Empty means "auto".
+type Strategy string
+
+const (
+	StrategyAuto     Strategy = "auto"
+	StrategyCheapest Strategy = "cheapest"
+	StrategyFastest  Strategy = "fastest"
+	StrategyBest     Strategy = "best"
+	StrategyBalanced Strategy = "balanced"
+	StrategyLocal    Strategy = "local"
+)
+
 type Policy struct {
 	MaxCostPerRun    float64        `yaml:"max_cost_per_run"`
 	Quality          QualityLevel   `yaml:"quality"`
@@ -136,11 +163,43 @@ type Policy struct {
 	AllowedProviders []string       `yaml:"allowed_providers"`
 	// PreferLocal restricts routing to local (Ollama) models — zero cost,
 	// fully private, no API key. Set `prefer_local: true` in the spec.
-	PreferLocal      bool           `yaml:"prefer_local"`
+	PreferLocal bool `yaml:"prefer_local"`
+
+	// ─── Policy-engine dimensions (all optional, backward compatible) ───
+
+	// QualityMinimum is an absolute minimum model quality (0..1). 0 means unset,
+	// in which case the Quality tier threshold applies.
+	QualityMinimum float64 `yaml:"quality_minimum"`
+	// LatencyMaxP95 caps acceptable model latency in ms. 0 means unset, in which
+	// case the Latency profile applies.
+	LatencyMaxP95 int `yaml:"latency_max_p95"`
+	// Privacy governs whether cloud providers may be used at all.
+	Privacy PrivacyLevel `yaml:"privacy"`
+	// LocalFirst prefers a policy-satisfying local model before considering
+	// cloud. Unlike PreferLocal it does not forbid cloud; it reorders selection.
+	LocalFirst bool `yaml:"local_first"`
+	// FallbackEnabled turns the fallback chain on. FallbackMaxAttempts bounds it.
+	FallbackEnabled     bool `yaml:"fallback_enabled"`
+	FallbackMaxAttempts int  `yaml:"fallback_max_attempts"`
+	// Strategy is the routing objective (auto/cheapest/fastest/best/balanced/
+	// local). Usually set via CLI --strategy, but may be pinned in the spec.
+	Strategy Strategy `yaml:"strategy"`
 }
 
 func DefaultPolicy() Policy {
-	return Policy{MaxCostPerRun: 0.10, Quality: QualityBalanced, Latency: LatencyBalanced, MaxRetries: 3}
+	return Policy{
+		MaxCostPerRun:       0.10,
+		Quality:             QualityBalanced,
+		Latency:             LatencyBalanced,
+		MaxRetries:          3,
+		FallbackEnabled:     true,
+		FallbackMaxAttempts: 2,
+	}
+}
+
+// LocalOnly reports whether the policy forbids cloud providers entirely.
+func (p Policy) LocalOnly() bool {
+	return p.Privacy == PrivacyLocal || p.PreferLocal
 }
 
 type MemoryConfig struct {
@@ -192,6 +251,13 @@ type ExecutionPlan struct {
 	Complexity            TaskComplexity  `json:"complexity"`
 	ExecutionSteps        []ExecutionStep `json:"execution_steps"`
 	CreatedAt             string          `json:"created_at"`
+
+	// ─── Intelligent-router decision (set by the compiler pipeline) ───
+	Strategy      Strategy `json:"strategy,omitempty"`
+	TaskType      string   `json:"task_type,omitempty"`
+	Difficulty    float64  `json:"difficulty,omitempty"`
+	Risk          string   `json:"risk,omitempty"`
+	RoutingReason string   `json:"routing_reason,omitempty"`
 }
 
 func shortID() string {
@@ -240,7 +306,9 @@ type RegistryEntry struct {
 
 func EstimateTokens(text string) int {
 	t := len(text) / 4
-	if t < 1 { return 1 }
+	if t < 1 {
+		return 1
+	}
 	return t
 }
 

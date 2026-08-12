@@ -19,10 +19,10 @@ var defaultRegistryDir = filepath.Join(os.Getenv("HOME"), ".aether", "registry")
 type index map[string]map[string]*core.RegistryEntry
 
 type Registry struct {
-	dir      string
-	pkgsDir  string
-	idxPath  string
-	idx      index
+	dir     string
+	pkgsDir string
+	idxPath string
+	idx     index
 }
 
 func New(dir string) *Registry {

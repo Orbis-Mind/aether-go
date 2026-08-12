@@ -101,18 +101,18 @@ func (s *Store) Summary() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"total_runs":        total,
-		"successful_runs":   successful,
-		"success_rate":      fmt.Sprintf("%.1f%%", 100*float64(successful)/float64(total)),
-		"cached_runs":       cached,
-		"cache_hit_rate":    fmt.Sprintf("%.1f%%", 100*float64(cached)/float64(total)),
-		"total_cost_usd":    totalCost,
-		"avg_cost_usd":      totalCost / float64(total),
-		"total_tokens":      totalTokens,
-		"avg_latency_ms":    totalLatency / float64(total),
-		"total_errors":      errorCount,
+		"total_runs":         total,
+		"successful_runs":    successful,
+		"success_rate":       fmt.Sprintf("%.1f%%", 100*float64(successful)/float64(total)),
+		"cached_runs":        cached,
+		"cache_hit_rate":     fmt.Sprintf("%.1f%%", 100*float64(cached)/float64(total)),
+		"total_cost_usd":     totalCost,
+		"avg_cost_usd":       totalCost / float64(total),
+		"total_tokens":       totalTokens,
+		"avg_latency_ms":     totalLatency / float64(total),
+		"total_errors":       errorCount,
 		"model_distribution": modelCounts,
-		"cost_by_model":     modelCosts,
+		"cost_by_model":      modelCosts,
 	}
 }
 

@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Patched Go toolchain. Keep current: govulncheck gates on the stdlib version
+  # this builds against, so an outdated toolchain fails the security job.
+  GO_VERSION: "1.26.11"
+
 jobs:
   test:
     name: Format, Vet, Test, Coverage
@@ -17,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
 
       - name: gofmt (check formatting)
         run: |
@@ -51,7 +56,7 @@ jobs:
           fetch-depth: 0 # gitleaks scans full history
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
 
       - name: govulncheck (known Go vulnerabilities)
         run: |
@@ -59,9 +64,14 @@ jobs:
           "$(go env GOPATH)/bin/govulncheck" ./...
 
       - name: gitleaks (secret scan)
-        uses: gitleaks/gitleaks-action@v2
+        # Use the OSS CLI, not gitleaks-action@v2, which requires a paid
+        # GITLEAKS_LICENSE for organization repositories.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: "8.21.2"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          /tmp/gitleaks git . --redact --exit-code 1
 
   build:
     name: Cross-platform build
@@ -78,7 +88,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
       - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
         env:
           GOOS: ${{ matrix.goos }}

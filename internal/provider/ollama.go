@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +14,23 @@ import (
 
 	"github.com/Orbis-Mind/aether/internal/core"
 )
+
+// classifyDoErr maps an *http.Client.Do error to a typed error. A cancelled or
+// timed-out context is surfaced as the context error (so the runtime can stop
+// or retry appropriately) rather than being mislabelled as "Ollama unreachable".
+// Genuine connection failures remain permanent for the current run.
+func classifyDoErr(ctx context.Context, host, model string, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		if errors.Is(cerr, context.DeadlineExceeded) {
+			return Transient("ollama request to %s timed out", host)
+		}
+		return cerr // context.Canceled — propagate for cancellation handling
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return Permanent("cannot reach Ollama at %s — start it with `ollama serve` and pull a model (`ollama pull %s`)", host, model)
+}
 
 // OllamaProvider talks to a local Ollama daemon (http://localhost:11434 by
 // default) over its OpenAI-adjacent chat API. Zero cost, fully offline once a
@@ -53,6 +71,26 @@ func (o *OllamaProvider) Name() string { return string(core.ProviderOllama) }
 
 func (o *OllamaProvider) Capabilities() Capabilities {
 	return Capabilities{Streaming: true, Tools: true, Local: true}
+}
+
+// HealthCheck probes the local Ollama daemon's /api/tags endpoint with a short
+// timeout. A healthy daemon returns nil; otherwise a descriptive error.
+func (o *OllamaProvider) HealthCheck(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", o.host+"/api/tags", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := o.client.Do(httpReq)
+	if err != nil {
+		return classifyDoErr(ctx, o.host, "", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ollama health check: HTTP %d from %s", resp.StatusCode, o.host)
+	}
+	return nil
 }
 
 type ollamaMessage struct {
@@ -123,7 +161,7 @@ func (o *OllamaProvider) Generate(ctx context.Context, req GenerateRequest) (Gen
 
 	resp, err := o.client.Do(httpReq)
 	if err != nil {
-		return GenerateResponse{}, Permanent("cannot reach Ollama at %s — start it with `ollama serve` and pull a model (`ollama pull %s`)", o.host, req.Model)
+		return GenerateResponse{}, classifyDoErr(ctx, o.host, req.Model, err)
 	}
 	defer resp.Body.Close()
 
@@ -160,7 +198,7 @@ func (o *OllamaProvider) Stream(ctx context.Context, req GenerateRequest) (<-cha
 
 	resp, err := o.client.Do(httpReq)
 	if err != nil {
-		return nil, Permanent("cannot reach Ollama at %s — start it with `ollama serve` and pull a model (`ollama pull %s`)", o.host, req.Model)
+		return nil, classifyDoErr(ctx, o.host, req.Model, err)
 	}
 
 	ch := make(chan StreamEvent)
@@ -243,7 +281,7 @@ func (o *OllamaProvider) List(ctx context.Context) ([]LocalModel, error) {
 	httpReq, _ := http.NewRequestWithContext(ctx, "GET", o.host+"/api/tags", nil)
 	resp, err := o.client.Do(httpReq)
 	if err != nil {
-		return nil, Permanent("Ollama not reachable at %s — run `ollama serve`", o.host)
+		return nil, classifyDoErr(ctx, o.host, "", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

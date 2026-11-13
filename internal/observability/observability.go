@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Orbis-Mind/aether/internal/core"
+	"github.com/Orbis-Mind/aether/internal/logging"
 )
 
 // ─────────────────────────────────────────────
@@ -35,6 +37,7 @@ type RunRecord struct {
 // ─────────────────────────────────────────────
 
 type Store struct {
+	mu      sync.Mutex
 	records []RunRecord
 	path    string
 }
@@ -47,6 +50,8 @@ func NewStore(dataDir string) *Store {
 }
 
 func (s *Store) Record(result *core.ExecutionResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.records = append(s.records, RunRecord{
 		RunID:        result.RunID,
 		PlanID:       result.PlanID,
@@ -69,6 +74,8 @@ func (s *Store) Record(result *core.ExecutionResult) {
 // ─────────────────────────────────────────────
 
 func (s *Store) Summary() map[string]interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.records) == 0 {
 		return map[string]interface{}{"message": "No runs recorded yet."}
 	}
@@ -117,8 +124,13 @@ func (s *Store) Summary() map[string]interface{} {
 }
 
 func (s *Store) RecentRuns(limit int) []RunRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if limit > len(s.records) {
 		limit = len(s.records)
+	}
+	if limit < 0 {
+		limit = 0
 	}
 	recent := s.records[len(s.records)-limit:]
 	// reverse
@@ -130,6 +142,8 @@ func (s *Store) RecentRuns(limit int) []RunRecord {
 }
 
 func (s *Store) LatencyPercentiles() map[string]float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.records) == 0 {
 		return nil
 	}
@@ -191,16 +205,27 @@ func RenderReport(s *Store) string {
 }
 
 func (s *Store) save() {
-	data, _ := json.MarshalIndent(s.records, "", "  ")
-	os.WriteFile(s.path, data, 0644)
+	data, err := json.MarshalIndent(s.records, "", "  ")
+	if err != nil {
+		logging.L().Warn("observability: marshal failed", "path", s.path, "err", err)
+		return
+	}
+	if err := os.WriteFile(s.path, data, 0644); err != nil {
+		logging.L().Warn("observability: persist failed", "path", s.path, "err", err)
+	}
 }
 
 func (s *Store) load() {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			logging.L().Warn("observability: read failed", "path", s.path, "err", err)
+		}
 		return
 	}
-	json.Unmarshal(data, &s.records)
+	if err := json.Unmarshal(data, &s.records); err != nil {
+		logging.L().Warn("observability: ignoring corrupt runs file", "path", s.path, "err", err)
+	}
 }
 
 func minInt(a, b int) int {

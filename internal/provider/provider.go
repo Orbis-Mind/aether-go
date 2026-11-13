@@ -92,6 +92,10 @@ type ModelProvider interface {
 	Generate(ctx context.Context, req GenerateRequest) (GenerateResponse, error)
 	Stream(ctx context.Context, req GenerateRequest) (<-chan StreamEvent, error)
 	Capabilities() Capabilities
+	// HealthCheck reports whether the provider is reachable and ready to serve
+	// (daemon up, required credentials present). It returns nil when healthy and
+	// a descriptive error otherwise. It must honour ctx for cancellation/timeout.
+	HealthCheck(ctx context.Context) error
 }
 
 // ─────────────────────────────────────────────
@@ -199,4 +203,35 @@ func IsPermanent(err error) bool {
 	}
 	var p *PermanentError
 	return errors.As(err, &p)
+}
+
+// TransientError marks a retryable failure (timeout, temporary network error,
+// provider 5xx). The runtime retries these with backoff rather than failing
+// fast as it does for PermanentError.
+type TransientError struct{ Err error }
+
+func (e *TransientError) Error() string { return e.Err.Error() }
+func (e *TransientError) Unwrap() error { return e.Err }
+
+// Transient wraps err as a TransientError.
+func Transient(format string, a ...any) error {
+	return &TransientError{Err: fmt.Errorf(format, a...)}
+}
+
+// IsTransient reports whether err (or anything it wraps) is a TransientError.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	var t *TransientError
+	return errors.As(err, &t)
+}
+
+// HealthCheck dispatches a readiness probe to the provider backing modelKey.
+func (r *Registry) HealthCheck(ctx context.Context, modelKey string) error {
+	p, _, err := r.forModelKey(modelKey)
+	if err != nil {
+		return err
+	}
+	return p.HealthCheck(ctx)
 }

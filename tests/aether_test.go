@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Orbis-Mind/aether/internal/cache"
+	"github.com/Orbis-Mind/aether/internal/classifier"
 	"github.com/Orbis-Mind/aether/internal/compiler"
 	"github.com/Orbis-Mind/aether/internal/core"
 	"github.com/Orbis-Mind/aether/internal/memory"
@@ -71,73 +72,74 @@ func TestEstimateTokens(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────
-// Router Tests
+// Router Tests (authoritative intelligent routing pipeline)
 // ─────────────────────────────────────────────
 
+// routeFor runs the one authoritative routing pipeline for a representative
+// task. (The legacy router.Router was removed in favour of router.Pipeline.)
+func routeFor(t *testing.T, pol core.Policy, strat core.Strategy, in, out int) (*router.Decision, error) {
+	t.Helper()
+	a := classifier.New().Classify("You are a helpful assistant.", "Summarize this text.", false)
+	return router.NewPipeline().Route(a, pol, strat, in, out, nil)
+}
+
 func TestRouterSelectsModel(t *testing.T) {
-	r := router.New()
 	policy := core.DefaultPolicy()
 	policy.MaxCostPerRun = 10.0
-
-	selected, err := r.Select(core.ComplexityModerate, policy, 100, 100)
+	dec, err := routeFor(t, policy, core.StrategyAuto, 100, 100)
 	if err != nil {
 		t.Fatalf("router failed: %v", err)
 	}
-	if _, ok := core.ModelCatalogue[selected]; !ok {
-		t.Errorf("selected unknown model: %s", selected)
+	if _, ok := core.ModelCatalogue[dec.Chosen]; !ok {
+		t.Errorf("selected unknown model: %s", dec.Chosen)
 	}
 }
 
-func TestRouterLowBudget(t *testing.T) {
-	r := router.New()
+func TestRouterLowBudgetRespectsCost(t *testing.T) {
 	policy := core.DefaultPolicy()
 	policy.MaxCostPerRun = 0.0001
-	policy.Quality = core.QualityDraft
-
-	selected, err := r.Select(core.ComplexityTrivial, policy, 10, 10)
+	dec, err := routeFor(t, policy, core.StrategyCheapest, 10, 10)
 	if err != nil {
 		t.Fatalf("router failed: %v", err)
 	}
-	m := core.ModelCatalogue[selected]
-	if m.CostEstimate(10, 10) > 0.0001 {
-		t.Errorf("selected model %s exceeds budget", selected)
+	if dec.ChosenCand.EstCost > 0.0001 {
+		t.Errorf("selected model %s exceeds budget: $%.6f", dec.Chosen, dec.ChosenCand.EstCost)
 	}
 }
 
-func TestRouterExpertQuality(t *testing.T) {
-	r := router.New()
+func TestRouterBestPicksHighestQuality(t *testing.T) {
 	policy := core.DefaultPolicy()
 	policy.MaxCostPerRun = 10.0
-	policy.Quality = core.QualityExpert
-
-	selected, err := r.Select(core.ComplexityExpert, policy, 500, 500)
+	dec, err := routeFor(t, policy, core.StrategyBest, 500, 500)
 	if err != nil {
 		t.Fatalf("router failed: %v", err)
 	}
-	m := core.ModelCatalogue[selected]
-	if m.QualityScore < 0.90 {
-		t.Errorf("expert quality should pick high-quality model, got score %.2f", m.QualityScore)
+	for _, c := range dec.Candidates {
+		if c.Eligible && c.Quality.Score > dec.ChosenCand.Quality.Score {
+			t.Errorf("best should pick highest quality; %s (%.2f) beats chosen (%.2f)",
+				c.Key, c.Quality.Score, dec.ChosenCand.Quality.Score)
+		}
 	}
 }
 
 func TestRouterImpossibleConstraints(t *testing.T) {
-	r := router.New()
 	policy := core.DefaultPolicy()
 	policy.MaxCostPerRun = 0.000001
-	policy.Quality = core.QualityExpert
-
-	_, err := r.Select(core.ComplexityExpert, policy, 500, 500)
+	policy.QualityMinimum = 0.99
+	_, err := routeFor(t, policy, core.StrategyBest, 500, 500)
 	if err == nil {
 		t.Error("expected routing error for impossible constraints")
 	}
 }
 
 func TestRouterExplain(t *testing.T) {
-	r := router.New()
-	table := r.Explain(core.ComplexityModerate, core.DefaultPolicy(), 300, 200)
-	if table == "" {
-		t.Error("explain should return non-empty string")
+	policy := core.DefaultPolicy()
+	policy.MaxCostPerRun = 10.0
+	dec, err := routeFor(t, policy, core.StrategyAuto, 300, 200)
+	if err != nil {
+		t.Fatalf("route failed: %v", err)
 	}
+	table := router.ExplainDecision(dec)
 	if len(table) < 100 {
 		t.Error("explain table seems too short")
 	}
@@ -221,7 +223,8 @@ func TestAEArtifactMagic(t *testing.T) {
 	result, _ := compiler.Compile(spec, dir, false)
 
 	data, _ := os.ReadFile(result.ArtifactPath)
-	magic := []byte("AETHER\x00\x01")
+	// New artifacts are written in the hardened v2 format (magic ends 0x02).
+	magic := []byte("AETHER\x00\x02")
 	for i, b := range magic {
 		if data[i] != b {
 			t.Errorf("bad magic byte at %d: expected %x, got %x", i, b, data[i])

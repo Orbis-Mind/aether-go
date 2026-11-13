@@ -49,6 +49,11 @@ func parseMap(lines []string, start, indent int) (map[string]interface{}, int, e
 			i++
 			continue
 		}
+		// Tabs are not valid YAML indentation; our space-based indent counter
+		// would silently misparse them, so reject them explicitly.
+		if strings.HasPrefix(line, "\t") {
+			return result, i, fmt.Errorf("line %d: tab indentation is not allowed; use spaces", i+1)
+		}
 		ind := indentOf(line)
 		if ind < indent {
 			break
@@ -65,11 +70,13 @@ func parseMap(lines []string, start, indent int) (map[string]interface{}, int, e
 
 		colonIdx := strings.Index(trimmed, ":")
 		if colonIdx < 0 {
-			i++
-			continue
+			return result, i, fmt.Errorf("line %d: expected 'key: value', got %q", i+1, trimmed)
 		}
 		key := strings.TrimSpace(trimmed[:colonIdx])
 		rest := strings.TrimSpace(trimmed[colonIdx+1:])
+		if _, dup := result[key]; dup {
+			return result, i, fmt.Errorf("line %d: duplicate key %q", i+1, key)
+		}
 
 		if rest != "" && rest != "|" && rest != ">" {
 			// Inline value
@@ -221,6 +228,13 @@ func parseScalar(s string) interface{} {
 	case "null", "~", "":
 		return nil
 	}
+	// Flow mapping {k: v, ...} and flow sequence [a, b, ...].
+	if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {
+		return parseFlowMap(s[1 : len(s)-1])
+	}
+	if len(s) >= 2 && s[0] == '[' && s[len(s)-1] == ']' {
+		return parseFlowSeq(s[1 : len(s)-1])
+	}
 	// Int
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return int(i)
@@ -230,6 +244,84 @@ func parseScalar(s string) interface{} {
 		return f
 	}
 	return s
+}
+
+// parseFlowMap parses an inline mapping body (the text between { and }), e.g.
+// "minimum: 0.9" or "enabled: true, max_attempts: 2". Values are parsed
+// recursively, so nested flow collections work.
+func parseFlowMap(body string) map[string]interface{} {
+	m := make(map[string]interface{})
+	for _, part := range splitFlow(body) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ci := strings.Index(part, ":")
+		if ci < 0 {
+			continue
+		}
+		k := strings.TrimSpace(part[:ci])
+		v := strings.TrimSpace(part[ci+1:])
+		m[k] = parseScalar(v)
+	}
+	return m
+}
+
+// parseFlowSeq parses an inline sequence body (the text between [ and ]).
+func parseFlowSeq(body string) []interface{} {
+	var out []interface{}
+	for _, part := range splitFlow(body) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, parseScalar(part))
+	}
+	return out
+}
+
+// splitFlow splits a flow-collection body on top-level commas, respecting nested
+// {}/[] and single/double quotes so commas inside them don't split.
+func splitFlow(s string) []string {
+	var parts []string
+	var cur strings.Builder
+	depth := 0
+	inS, inD := false, false
+	for _, r := range s {
+		switch {
+		case inS:
+			cur.WriteRune(r)
+			if r == '\'' {
+				inS = false
+			}
+		case inD:
+			cur.WriteRune(r)
+			if r == '"' {
+				inD = false
+			}
+		case r == '\'':
+			inS = true
+			cur.WriteRune(r)
+		case r == '"':
+			inD = true
+			cur.WriteRune(r)
+		case r == '{' || r == '[':
+			depth++
+			cur.WriteRune(r)
+		case r == '}' || r == ']':
+			depth--
+			cur.WriteRune(r)
+		case r == ',' && depth == 0:
+			parts = append(parts, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if cur.Len() > 0 {
+		parts = append(parts, cur.String())
+	}
+	return parts
 }
 
 // GetString safely extracts a string from a parsed map.

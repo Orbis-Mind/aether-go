@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,22 @@ import (
 
 	"github.com/Orbis-Mind/aether/internal/core"
 )
+
+// classifyCloudErr maps an http.Client.Do error for a cloud provider: context
+// cancellation/timeout is surfaced as-is or as a transient timeout; other
+// network errors are transient (retryable), since a cloud endpoint may recover.
+func classifyCloudErr(ctx context.Context, name string, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		if errors.Is(cerr, context.DeadlineExceeded) {
+			return Transient("%s request timed out", name)
+		}
+		return cerr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return Transient("%s: %v", name, err)
+}
 
 // This file holds OPTIONAL cloud providers. They implement the same
 // ModelProvider interface as the local ones but are never required: without an
@@ -36,6 +53,19 @@ func (p *OpenAIProvider) Name() string { return string(core.ProviderOpenAI) }
 
 func (p *OpenAIProvider) Capabilities() Capabilities {
 	return Capabilities{Streaming: false, Tools: true, Vision: true}
+}
+
+// HealthCheck reports readiness: an OpenAI-compatible endpoint needs either an
+// API key or a local base URL configured. It does not spend a request probing
+// the remote API (which would cost money / rate limit).
+func (p *OpenAIProvider) HealthCheck(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("OPENAI_BASE_URL") == "" {
+		return Permanent("OPENAI_API_KEY not set — export it or point OPENAI_BASE_URL at a local server")
+	}
+	return nil
 }
 
 func (p *OpenAIProvider) baseURL() string {
@@ -87,7 +117,7 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req GenerateRequest) (Gen
 	}
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return GenerateResponse{}, fmt.Errorf("openai: %w", err)
+		return GenerateResponse{}, classifyCloudErr(ctx, "openai", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
@@ -135,6 +165,17 @@ func (p *AnthropicProvider) Capabilities() Capabilities {
 	return Capabilities{Streaming: false, Tools: true, Vision: true}
 }
 
+// HealthCheck reports readiness: the Anthropic API requires ANTHROPIC_API_KEY.
+func (p *AnthropicProvider) HealthCheck(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		return Permanent("ANTHROPIC_API_KEY not set — export it or use a local Ollama model")
+	}
+	return nil
+}
+
 type anthropicResponse struct {
 	Content []struct {
 		Type string `json:"type"`
@@ -175,7 +216,7 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req GenerateRequest) (
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return GenerateResponse{}, fmt.Errorf("anthropic: %w", err)
+		return GenerateResponse{}, classifyCloudErr(ctx, "anthropic", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)

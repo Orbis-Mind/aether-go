@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Orbis-Mind/aether/internal/core"
+	"github.com/Orbis-Mind/aether/internal/logging"
 )
 
 const embeddingDim = 256
@@ -80,6 +82,7 @@ func (e *Entry) IsExpired() bool {
 // ─────────────────────────────────────────────
 
 type VectorStore struct {
+	mu          sync.Mutex
 	entries     []*Entry
 	persistPath string
 }
@@ -101,9 +104,36 @@ func (vs *VectorStore) Add(key, content string, metadata map[string]string, ttl 
 		TTLSeconds: ttl,
 		Embedding:  embed(content),
 	}
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 	vs.entries = append(vs.entries, e)
 	vs.save()
 	return e
+}
+
+// Delete removes the entry with the given key, returning true if one was found.
+// Supports the right-to-erasure / data-deletion requirement.
+func (vs *VectorStore) Delete(key string) bool {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	for i, e := range vs.entries {
+		if e.Key == key {
+			vs.entries = append(vs.entries[:i], vs.entries[i+1:]...)
+			vs.save()
+			return true
+		}
+	}
+	return false
+}
+
+// Purge removes all stored entries and persists the empty store.
+func (vs *VectorStore) Purge() int {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	n := len(vs.entries)
+	vs.entries = nil
+	vs.save()
+	return n
 }
 
 type SearchResult struct {
@@ -113,6 +143,8 @@ type SearchResult struct {
 
 func (vs *VectorStore) Search(query string, topK int, minSim float64) []SearchResult {
 	qEmb := embed(query)
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 	var results []SearchResult
 	for _, e := range vs.entries {
 		if e.IsExpired() {
@@ -141,6 +173,8 @@ func (vs *VectorStore) Search(query string, topK int, minSim float64) []SearchRe
 }
 
 func (vs *VectorStore) Count() int {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 	count := 0
 	for _, e := range vs.entries {
 		if !e.IsExpired() {
@@ -154,17 +188,32 @@ func (vs *VectorStore) save() {
 	if vs.persistPath == "" {
 		return
 	}
-	os.MkdirAll(filepath.Dir(vs.persistPath), 0755)
-	data, _ := json.MarshalIndent(vs.entries, "", "  ")
-	os.WriteFile(vs.persistPath, data, 0644)
+	if err := os.MkdirAll(filepath.Dir(vs.persistPath), 0755); err != nil {
+		logging.L().Warn("memory: mkdir failed", "path", vs.persistPath, "err", err)
+		return
+	}
+	data, err := json.MarshalIndent(vs.entries, "", "  ")
+	if err != nil {
+		logging.L().Warn("memory: marshal failed", "path", vs.persistPath, "err", err)
+		return
+	}
+	if err := os.WriteFile(vs.persistPath, data, 0644); err != nil {
+		logging.L().Warn("memory: persist failed", "path", vs.persistPath, "err", err)
+	}
 }
 
 func (vs *VectorStore) load() {
 	data, err := os.ReadFile(vs.persistPath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			logging.L().Warn("memory: read failed", "path", vs.persistPath, "err", err)
+		}
 		return
 	}
-	json.Unmarshal(data, &vs.entries)
+	if err := json.Unmarshal(data, &vs.entries); err != nil {
+		logging.L().Warn("memory: ignoring corrupt store file", "path", vs.persistPath, "err", err)
+		return
+	}
 	for _, e := range vs.entries {
 		if e.Embedding == nil {
 			e.Embedding = embed(e.Content)
@@ -177,6 +226,7 @@ func (vs *VectorStore) load() {
 // ─────────────────────────────────────────────
 
 type EntityMemory struct {
+	mu       sync.RWMutex
 	entities map[string]map[string]string
 }
 
@@ -185,6 +235,8 @@ func NewEntityMemory() *EntityMemory {
 }
 
 func (em *EntityMemory) Upsert(name string, attrs map[string]string) {
+	em.mu.Lock()
+	defer em.mu.Unlock()
 	key := strings.ToLower(name)
 	if em.entities[key] == nil {
 		em.entities[key] = make(map[string]string)
@@ -196,10 +248,14 @@ func (em *EntityMemory) Upsert(name string, attrs map[string]string) {
 }
 
 func (em *EntityMemory) Get(name string) map[string]string {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
 	return em.entities[strings.ToLower(name)]
 }
 
 func (em *EntityMemory) ToContext() string {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
 	if len(em.entities) == 0 {
 		return ""
 	}
@@ -216,6 +272,8 @@ func (em *EntityMemory) ToContext() string {
 }
 
 func (em *EntityMemory) Count() int {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
 	return len(em.entities)
 }
 
@@ -231,6 +289,7 @@ type Relationship struct {
 }
 
 type RelationshipMemory struct {
+	mu    sync.RWMutex
 	edges []Relationship
 }
 
@@ -239,6 +298,8 @@ func NewRelationshipMemory() *RelationshipMemory {
 }
 
 func (rm *RelationshipMemory) Add(source, relation, target string, confidence float64) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
 	rm.edges = append(rm.edges, Relationship{
 		Source:     strings.ToLower(source),
 		Relation:   relation,
@@ -248,6 +309,8 @@ func (rm *RelationshipMemory) Add(source, relation, target string, confidence fl
 }
 
 func (rm *RelationshipMemory) ToContext() string {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
 	if len(rm.edges) == 0 {
 		return ""
 	}
@@ -260,6 +323,8 @@ func (rm *RelationshipMemory) ToContext() string {
 }
 
 func (rm *RelationshipMemory) Count() int {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
 	return len(rm.edges)
 }
 
@@ -348,6 +413,31 @@ func (o *Orchestrator) Retrieve(query string, topK int) string {
 	}
 
 	return strings.Join(parts, "\n")
+}
+
+// Forget deletes a stored memory by key from both vector stores, returning the
+// number of entries removed. Exposes data deletion to callers.
+func (o *Orchestrator) Forget(key string) int {
+	n := 0
+	if o.Semantic != nil && o.Semantic.Delete(key) {
+		n++
+	}
+	if o.LongTerm != nil && o.LongTerm.Delete(key) {
+		n++
+	}
+	return n
+}
+
+// Clear purges all vector-store memory and returns the number of entries removed.
+func (o *Orchestrator) Clear() int {
+	n := 0
+	if o.Semantic != nil {
+		n += o.Semantic.Purge()
+	}
+	if o.LongTerm != nil {
+		n += o.LongTerm.Purge()
+	}
+	return n
 }
 
 func (o *Orchestrator) Stats() map[string]int {

@@ -261,9 +261,13 @@ type ExecutionPlan struct {
 }
 
 func shortID() string {
-	b := make([]byte, 4)
-	rand.Read(b)
-	return fmt.Sprintf("%08x", b)
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing is extraordinary; fall back to a time-based ID so we
+		// never return an empty or colliding identifier.
+		return fmt.Sprintf("t%x", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b)
 }
 
 func NewExecutionPlan() ExecutionPlan {

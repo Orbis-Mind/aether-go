@@ -1,9 +1,34 @@
 package eval
 
 import (
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
 )
+
+var (
+	answerIsRe = regexp.MustCompile(`(?i)answer is\s*:?\s*(-?\d+(?:\.\d+)?)`)
+	numberRe   = regexp.MustCompile(`-?\d+(?:\.\d+)?`)
+)
+
+// finalNumber extracts a model's final numeric answer using the standard method:
+// the number after the last "answer is ...", else the last number in the text.
+// Commas and currency/percent symbols are stripped first.
+func finalNumber(text string) (float64, bool) {
+	t := strings.NewReplacer(",", "", "$", "", "%", "").Replace(text)
+	if m := answerIsRe.FindAllStringSubmatch(t, -1); len(m) > 0 {
+		if v, err := strconv.ParseFloat(m[len(m)-1][1], 64); err == nil {
+			return v, true
+		}
+	}
+	nums := numberRe.FindAllString(t, -1)
+	if len(nums) == 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(nums[len(nums)-1], 64)
+	return v, err == nil
+}
 
 // Score is the result of scoring one model output against one item.
 type Score struct {
@@ -41,6 +66,15 @@ func ScoreItem(it Item, output string) Score {
 	if it.ExpectRegex != "" {
 		re, err := regexp.Compile(it.ExpectRegex)
 		if err == nil && re.MatchString(output) {
+			parts = append(parts, 1.0)
+		} else {
+			parts = append(parts, 0.0)
+		}
+	}
+	if it.ExpectAnswer != "" {
+		want, werr := strconv.ParseFloat(strings.NewReplacer(",", "", "$", "", "%", "").Replace(it.ExpectAnswer), 64)
+		got, ok := finalNumber(output)
+		if werr == nil && ok && math.Abs(want-got) < 1e-4 {
 			parts = append(parts, 1.0)
 		} else {
 			parts = append(parts, 0.0)

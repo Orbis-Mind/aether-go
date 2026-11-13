@@ -154,14 +154,14 @@ func cmdEvaluate(args []string) {
 	modelsFlag := fs.String("models", "", "comma-separated catalogue keys to evaluate (default: installed local models)")
 	maxTokens := fs.Int("max-tokens", 512, "max tokens per generation")
 	save := fs.Bool("save", true, "save measured quality for future routing")
-	fs.Parse(args)
+	positionals := parseInterspersed(fs, args) // flags may precede or follow the dataset path
 	banner()
 
 	// Dataset: positional path, else embedded default.
 	var ds *eval.Dataset
 	var err error
-	if fs.NArg() > 0 {
-		ds, err = eval.Load(fs.Arg(0))
+	if len(positionals) > 0 {
+		ds, err = eval.Load(positionals[0])
 	} else {
 		ds, err = eval.Default()
 	}

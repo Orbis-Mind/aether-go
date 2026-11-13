@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Orbis-Mind/aether/internal/core"
@@ -38,6 +39,42 @@ func classifyDoErr(ctx context.Context, host, model string, err error) error {
 type OllamaProvider struct {
 	host   string
 	client *http.Client
+
+	mu          sync.Mutex
+	installed   []LocalModel
+	installedAt time.Time
+}
+
+// resolveModel maps a catalogue model name to the tag actually installed in
+// Ollama. Catalogue IDs are often untagged (e.g. "qwen2.5"), but Ollama only
+// auto-resolves untagged names to ":latest" — so a model installed as
+// "qwen2.5:3b" would 404. When the name has no explicit tag and no exact match
+// is installed, we substitute the first installed "name:*" tag. The installed
+// list is cached briefly to avoid a lookup on every call.
+func (o *OllamaProvider) resolveModel(ctx context.Context, name string) string {
+	if strings.Contains(name, ":") {
+		return name
+	}
+	o.mu.Lock()
+	if o.installed == nil || time.Since(o.installedAt) > 10*time.Second {
+		if ms, err := o.List(ctx); err == nil {
+			o.installed, o.installedAt = ms, time.Now()
+		}
+	}
+	installed := o.installed
+	o.mu.Unlock()
+
+	for _, m := range installed {
+		if m.Name == name { // exact (untagged) match exists
+			return name
+		}
+	}
+	for _, m := range installed {
+		if strings.HasPrefix(m.Name, name+":") { // e.g. qwen2.5 -> qwen2.5:3b
+			return m.Name
+		}
+	}
+	return name
 }
 
 // NewOllamaProvider builds a provider for the given host. An empty host uses
@@ -150,6 +187,7 @@ func (o *OllamaProvider) countTokens(chunk ollamaChatChunk, req GenerateRequest,
 }
 
 func (o *OllamaProvider) Generate(ctx context.Context, req GenerateRequest) (GenerateResponse, error) {
+	req.Model = o.resolveModel(ctx, req.Model)
 	body, _ := json.Marshal(ollamaRequest{
 		Model:    req.Model,
 		Stream:   false,
@@ -187,6 +225,7 @@ func (o *OllamaProvider) Generate(ctx context.Context, req GenerateRequest) (Gen
 }
 
 func (o *OllamaProvider) Stream(ctx context.Context, req GenerateRequest) (<-chan StreamEvent, error) {
+	req.Model = o.resolveModel(ctx, req.Model)
 	body, _ := json.Marshal(ollamaRequest{
 		Model:    req.Model,
 		Stream:   true,

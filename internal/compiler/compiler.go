@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,13 +21,61 @@ import (
 	"github.com/Orbis-Mind/aether/internal/yamlx"
 )
 
-var aeMagic = []byte("AETHER\x00\x01")
+// ─────────────────────────────────────────────
+// Artifact format
+// ─────────────────────────────────────────────
+//
+// The .ae container is: magic(8) ‖ payloadSize(uint32 BE, 4) ‖ checksum ‖ payload.
+//
+//	v1 (legacy): magic ends 0x01, checksum is the first 4 bytes of sha256(payload).
+//	v2 (current): magic ends 0x02, checksum is the full 32-byte sha256(payload),
+//	              verified on read. New artifacts are always written as v2.
+//
+// Readers accept both versions; writers emit v2 only.
+var (
+	aeMagicV1 = []byte("AETHER\x00\x01")
+	aeMagicV2 = []byte("AETHER\x00\x02")
+)
+
+const (
+	aeMagicLen  = 8
+	aeHeaderV1  = aeMagicLen + 4 + 4  // 16: magic + size + truncated checksum
+	aeHeaderV2  = aeMagicLen + 4 + 32 // 44: magic + size + full sha256
+	aeChecksumV = "AETHER"            // magic ASCII prefix (bytes 0..5)
+
+	// Size limits guard against resource exhaustion from untrusted input.
+	maxSpecSize     = 5 << 20   // 5 MiB: largest accepted .ae.yaml spec
+	maxArtifactSize = 64 << 20  // 64 MiB: largest accepted .ae payload
+	maxUncompressed = 128 << 20 // 128 MiB: zip-bomb guard (total decompressed)
+)
+
+// deterministicPlanID derives a stable, content-addressed plan ID from the spec
+// so the same spec always compiles to the same artifact (no random component).
+func deterministicPlanID(specJSON []byte) string {
+	sum := sha256.Sum256(specJSON)
+	return "plan-" + hex.EncodeToString(sum[:6])
+}
+
+// buildTime returns the timestamp embedded in artifacts. It honours
+// SOURCE_DATE_EPOCH (the reproducible-builds convention) and otherwise defaults
+// to the Unix epoch, keeping compilation deterministic by default.
+func buildTime() time.Time {
+	if s := os.Getenv("SOURCE_DATE_EPOCH"); s != "" {
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return time.Unix(n, 0).UTC()
+		}
+	}
+	return time.Unix(0, 0).UTC()
+}
 
 type ValidationError struct{ msg string }
 
 func (e ValidationError) Error() string { return "validation error: " + e.msg }
 
 func ValidateYAML(path string) (*core.AetherSpec, error) {
+	if info, err := os.Stat(path); err == nil && info.Size() > maxSpecSize {
+		return nil, ValidationError{fmt.Sprintf("spec file too large: %d bytes (max %d)", info.Size(), maxSpecSize)}
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read spec: %w", err)
@@ -34,6 +84,10 @@ func ValidateYAML(path string) (*core.AetherSpec, error) {
 	raw, err := yamlx.Unmarshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("invalid YAML: %w", err)
+	}
+
+	if err := validateSchema(raw); err != nil {
+		return nil, err
 	}
 
 	name := yamlx.GetString(raw, "name")
@@ -88,6 +142,54 @@ func ValidateYAML(path string) (*core.AetherSpec, error) {
 	}
 
 	return spec, nil
+}
+
+// Schema allow-lists. Keys outside these sets are rejected with an actionable
+// error so typos (e.g. `qualdity:`) fail fast instead of being silently ignored.
+var (
+	knownTopLevel = set("name", "version", "description", "policy", "memory", "tools", "prompts", "metadata")
+	knownPolicy   = set("max_cost_per_run", "cost", "quality", "latency", "max_retries",
+		"fallback_models", "allowed_providers", "prefer_local", "quality_minimum",
+		"latency_max_p95", "privacy", "execution", "fallback", "strategy",
+		"local_first", "fallback_enabled", "fallback_max_attempts")
+	knownMemory = set("semantic", "long_term", "entity", "relationship", "ttl_seconds")
+)
+
+func set(keys ...string) map[string]bool {
+	m := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		m[k] = true
+	}
+	return m
+}
+
+// validateSchema rejects unknown keys at the top level and inside the policy and
+// memory blocks, listing the offending key. Free-form blocks (prompts, metadata,
+// tools) are not key-checked.
+func validateSchema(raw map[string]interface{}) error {
+	if err := checkKeys(raw, knownTopLevel, "top level"); err != nil {
+		return err
+	}
+	if pm := yamlx.GetMap(raw, "policy"); pm != nil {
+		if err := checkKeys(pm, knownPolicy, "policy"); err != nil {
+			return err
+		}
+	}
+	if mm := yamlx.GetMap(raw, "memory"); mm != nil {
+		if err := checkKeys(mm, knownMemory, "memory"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkKeys(m map[string]interface{}, allowed map[string]bool, where string) error {
+	for k := range m {
+		if !allowed[k] {
+			return ValidationError{fmt.Sprintf("unknown %s key %q", where, k)}
+		}
+	}
+	return nil
 }
 
 // parsePolicy reads a policy block supporting BOTH the original flat form and
@@ -239,7 +341,17 @@ func Compile(spec *core.AetherSpec, outputDir string, verbose bool) (*CompileRes
 		cacheStrat = "exact"
 	}
 
+	// Deterministic compilation: the artifact must be byte-identical for the same
+	// spec. Derive the plan ID from spec content and use a reproducible build
+	// time instead of a random ID + wall clock (see deterministicPlanID/buildTime).
+	specJSON, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("serialize spec: %w", err)
+	}
+
 	plan := core.NewExecutionPlan()
+	plan.PlanID = deterministicPlanID(specJSON)
+	plan.CreatedAt = buildTime().Format(time.RFC3339)
 	plan.SpecName = spec.Name
 	plan.SpecVersion = spec.Version
 	plan.SelectedModel = selectedModel
@@ -304,40 +416,63 @@ func writeAE(spec *core.AetherSpec, plan *core.ExecutionPlan, path string) error
 		if err != nil {
 			return err
 		}
-		_, err = w.Write([]byte(text))
+		_, err = io.WriteString(w, text)
 		return err
 	}
 
 	manifest := map[string]interface{}{
-		"aether_version": "0.1.0", "artifact_version": "1",
+		"aether_version": "0.1.0", "artifact_version": "2",
 		"name": spec.Name, "version": spec.Version, "description": spec.Description,
 		"plan_id": plan.PlanID, "selected_model": plan.SelectedModel,
 		"complexity": string(plan.Complexity), "estimated_cost": plan.EstimatedCost,
 		"created_at": plan.CreatedAt,
 	}
-	writeJSON("manifest.json", manifest)
-	writeJSON("spec.json", spec)
-	writeJSON("plan.json", plan)
-	writeText("prompts/system.txt", plan.OptimizedSystemPrompt)
-	writeText("prompts/user_template.txt", plan.OptimizedUserTemplate)
-	zw.Close()
+	// Propagate every write error instead of silently producing a corrupt artifact.
+	if err := writeJSON("manifest.json", manifest); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	if err := writeJSON("spec.json", spec); err != nil {
+		return fmt.Errorf("write spec: %w", err)
+	}
+	if err := writeJSON("plan.json", plan); err != nil {
+		return fmt.Errorf("write plan: %w", err)
+	}
+	if err := writeText("prompts/system.txt", plan.OptimizedSystemPrompt); err != nil {
+		return fmt.Errorf("write system prompt: %w", err)
+	}
+	if err := writeText("prompts/user_template.txt", plan.OptimizedUserTemplate); err != nil {
+		return fmt.Errorf("write user template: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("finalize artifact zip: %w", err)
+	}
 
 	payload := buf.Bytes()
+	if len(payload) > maxArtifactSize {
+		return fmt.Errorf("artifact payload too large: %d bytes (max %d)", len(payload), maxArtifactSize)
+	}
 	sum := sha256.Sum256(payload)
+
+	// v2 header: magic ‖ size ‖ full sha256.
+	header := make([]byte, 0, aeHeaderV2)
+	header = append(header, aeMagicV2...)
+	var sizeBuf [4]byte
+	binary.BigEndian.PutUint32(sizeBuf[:], uint32(len(payload)))
+	header = append(header, sizeBuf[:]...)
+	header = append(header, sum[:]...)
 
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	f.Write(aeMagic)
-	sizeBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(sizeBuf, uint32(len(payload)))
-	f.Write(sizeBuf)
-	f.Write(sum[:4])
-	f.Write(payload)
-	return nil
+	if _, err := f.Write(header); err != nil {
+		return fmt.Errorf("write artifact header: %w", err)
+	}
+	if _, err := f.Write(payload); err != nil {
+		return fmt.Errorf("write artifact payload: %w", err)
+	}
+	return f.Sync()
 }
 
 type ArtifactContents struct {
@@ -349,45 +484,129 @@ type ArtifactContents struct {
 }
 
 func ReadAEArtifact(path string) (*ArtifactContents, error) {
+	if info, err := os.Stat(path); err == nil && info.Size() > int64(maxArtifactSize)+aeHeaderV2 {
+		return nil, fmt.Errorf("artifact too large: %d bytes (max %d)", info.Size(), maxArtifactSize)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read artifact: %w", err)
 	}
-	if len(data) < 16 {
-		return nil, fmt.Errorf("artifact too small")
+
+	payload, version, err := decodeFrame(data)
+	if err != nil {
+		return nil, err
 	}
-	if !bytes.Equal(data[:8], aeMagic) {
-		return nil, fmt.Errorf("invalid .ae artifact")
-	}
-	size := binary.BigEndian.Uint32(data[8:12])
-	payload := data[16 : 16+size]
 
 	zr, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
 	if err != nil {
 		return nil, fmt.Errorf("cannot open artifact zip: %w", err)
 	}
 
+	// Zip-bomb guard: refuse artifacts that declare an implausible decompressed size.
+	var totalUncompressed uint64
+	for _, f := range zr.File {
+		totalUncompressed += f.UncompressedSize64
+		if totalUncompressed > maxUncompressed {
+			return nil, fmt.Errorf("artifact decompresses to too much data (> %d bytes)", maxUncompressed)
+		}
+	}
+
 	readFile := func(name string) ([]byte, error) {
 		for _, f := range zr.File {
 			if f.Name == name {
-				rc, _ := f.Open()
+				rc, err := f.Open()
+				if err != nil {
+					return nil, fmt.Errorf("open %s: %w", name, err)
+				}
 				defer rc.Close()
-				return io.ReadAll(rc)
+				return io.ReadAll(io.LimitReader(rc, maxUncompressed))
 			}
 		}
 		return nil, fmt.Errorf("%s not found in artifact", name)
 	}
 
 	ac := &ArtifactContents{}
-	manifestData, _ := readFile("manifest.json")
-	json.Unmarshal(manifestData, &ac.Manifest)
-	specData, _ := readFile("spec.json")
-	json.Unmarshal(specData, &ac.Spec)
-	planData, _ := readFile("plan.json")
-	json.Unmarshal(planData, &ac.Plan)
-	sys, _ := readFile("prompts/system.txt")
+	if err := readJSONMember(readFile, "manifest.json", &ac.Manifest); err != nil {
+		return nil, err
+	}
+	if err := readJSONMember(readFile, "spec.json", &ac.Spec); err != nil {
+		return nil, err
+	}
+	if err := readJSONMember(readFile, "plan.json", &ac.Plan); err != nil {
+		return nil, err
+	}
+	sys, err := readFile("prompts/system.txt")
+	if err != nil {
+		return nil, err
+	}
 	ac.SystemPrompt = string(sys)
-	usr, _ := readFile("prompts/user_template.txt")
+	usr, err := readFile("prompts/user_template.txt")
+	if err != nil {
+		return nil, err
+	}
 	ac.UserTemplate = string(usr)
+	_ = version
 	return ac, nil
+}
+
+// decodeFrame validates the .ae container header, bounds-checks the declared
+// payload size against the actual file, verifies the integrity checksum, and
+// returns the raw zip payload. It never slices on untrusted sizes without a
+// prior bounds check, so a corrupt or truncated artifact yields an error, never
+// a panic. Both v1 (truncated checksum) and v2 (full sha256) frames are accepted.
+func decodeFrame(data []byte) (payload []byte, version byte, err error) {
+	if len(data) < aeMagicLen {
+		return nil, 0, fmt.Errorf("artifact too small (%d bytes)", len(data))
+	}
+	if string(data[:6]) != aeChecksumV || data[6] != 0x00 {
+		return nil, 0, fmt.Errorf("not an Aether artifact (bad magic)")
+	}
+	version = data[7]
+
+	var headerLen int
+	switch version {
+	case 0x01:
+		headerLen = aeHeaderV1
+	case 0x02:
+		headerLen = aeHeaderV2
+	default:
+		return nil, 0, fmt.Errorf("unsupported artifact version %d", version)
+	}
+	if len(data) < headerLen {
+		return nil, 0, fmt.Errorf("artifact truncated: header needs %d bytes, have %d", headerLen, len(data))
+	}
+
+	size := binary.BigEndian.Uint32(data[8:12])
+	avail := len(data) - headerLen
+	if uint64(size) > uint64(avail) {
+		return nil, 0, fmt.Errorf("artifact corrupt: declared payload size %d exceeds available %d bytes", size, avail)
+	}
+	if size > maxArtifactSize {
+		return nil, 0, fmt.Errorf("artifact payload too large: %d bytes (max %d)", size, maxArtifactSize)
+	}
+	payload = data[headerLen : headerLen+int(size)]
+
+	got := sha256.Sum256(payload)
+	switch version {
+	case 0x02:
+		if !bytes.Equal(data[12:44], got[:]) {
+			return nil, 0, fmt.Errorf("artifact integrity check failed: checksum mismatch (file may be corrupt or tampered)")
+		}
+	case 0x01:
+		if !bytes.Equal(data[12:16], got[:4]) {
+			return nil, 0, fmt.Errorf("artifact integrity check failed: v1 checksum mismatch")
+		}
+	}
+	return payload, version, nil
+}
+
+func readJSONMember(read func(string) ([]byte, error), name string, dst interface{}) error {
+	b, err := read(name)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(b, dst); err != nil {
+		return fmt.Errorf("decode %s: %w", name, err)
+	}
+	return nil
 }

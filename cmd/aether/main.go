@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Orbis-Mind/aether/internal/classifier"
@@ -19,7 +22,9 @@ import (
 	"github.com/Orbis-Mind/aether/internal/runtime"
 )
 
-const version = "0.1.0"
+// version is overridable at build time via -ldflags "-X main.version=...".
+// It must be a var (not const) for the linker's -X to take effect.
+var version = "0.1.0"
 
 // ─── Color helpers (ANSI, work on Windows 10+ terminal) ───────────────────
 func cyan(s string) string   { return "\033[36;1m" + s + "\033[0m" }
@@ -176,16 +181,33 @@ prompts:
 }
 
 // ─── build ────────────────────────────────────────────────────────────────
+// parseInterspersed parses a flag set allowing flags to appear before or after
+// positional arguments (Go's stdlib flag stops at the first positional). Returns
+// the positional arguments in order.
+func parseInterspersed(fs *flag.FlagSet, args []string) []string {
+	var positionals []string
+	for {
+		fs.Parse(args)
+		rest := fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positionals = append(positionals, rest[0])
+		args = rest[1:]
+	}
+	return positionals
+}
+
 func cmdBuild(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	output := fs.String("output", ".", "output directory")
 	verbose := fs.Bool("verbose", false, "verbose output")
-	fs.Parse(args)
+	positionals := parseInterspersed(fs, args)
 
 	banner()
 	specPath := ""
-	if fs.NArg() > 0 {
-		specPath = fs.Arg(0)
+	if len(positionals) > 0 {
+		specPath = positionals[0]
 	}
 	p, err := findSpec(specPath)
 	if err != nil {
@@ -279,10 +301,14 @@ func cmdRun(args []string) {
 
 	rt := runtime.New(&ac.Spec, &ac.Plan, dataDir())
 
+	// Cancel in-flight generation on Ctrl-C / SIGTERM.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	if *stream && !*jsonOut {
 		info("Streaming from " + ac.Plan.SelectedModel + "...")
 		fmt.Println(cyan("  ─── Response ─────────────────────────────") + "\n")
-		result := rt.RunStream(*message, nil, os.Stdout)
+		result := rt.RunStreamContext(ctx, *message, nil, os.Stdout)
 		fmt.Println()
 		if !result.Success {
 			fail("Execution failed: " + result.Error)
@@ -296,7 +322,7 @@ func cmdRun(args []string) {
 	}
 
 	info("Executing...")
-	result := rt.Run(*message, nil)
+	result := rt.RunContext(ctx, *message, nil)
 
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)

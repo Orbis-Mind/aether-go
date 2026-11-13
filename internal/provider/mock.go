@@ -22,6 +22,10 @@ func (m *MockProvider) Capabilities() Capabilities {
 	return Capabilities{Streaming: true, Tools: true, Local: true}
 }
 
+// HealthCheck always succeeds (unless ctx is already done): the mock provider is
+// always available and offline.
+func (m *MockProvider) HealthCheck(ctx context.Context) error { return ctx.Err() }
+
 func lastUser(req GenerateRequest) string {
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == RoleUser {

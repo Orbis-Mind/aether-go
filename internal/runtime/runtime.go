@@ -6,14 +6,17 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/Orbis-Mind/aether/internal/cache"
 	"github.com/Orbis-Mind/aether/internal/classifier"
 	"github.com/Orbis-Mind/aether/internal/core"
+	"github.com/Orbis-Mind/aether/internal/logging"
 	"github.com/Orbis-Mind/aether/internal/memory"
 	"github.com/Orbis-Mind/aether/internal/observability"
 	"github.com/Orbis-Mind/aether/internal/provider"
@@ -89,25 +92,30 @@ func (r *Runtime) prepare(userMessage string, variables map[string]string) rende
 
 // fallbackChain returns the ordered model keys to try: primary then any
 // fallback models, honouring the fallback policy toggle.
+//
+// FallbackMaxAttempts bounds how many fallback models (beyond the primary) may
+// be appended; 0 means "no explicit bound" → use every configured fallback.
 func (r *Runtime) fallbackChain() []string {
 	chain := []string{r.plan.SelectedModel}
-	if r.spec.Policy.FallbackEnabled || len(r.spec.Policy.FallbackModels) > 0 {
-		max := r.spec.Policy.FallbackMaxAttempts
-		for _, m := range r.spec.Policy.FallbackModels {
-			if max > 0 && len(chain) > max {
-				break
-			}
-			chain = append(chain, m)
+	if !r.spec.Policy.FallbackEnabled && len(r.spec.Policy.FallbackModels) == 0 {
+		return chain
+	}
+	maxFallbacks := r.spec.Policy.FallbackMaxAttempts
+	for _, m := range r.spec.Policy.FallbackModels {
+		if maxFallbacks > 0 && len(chain)-1 >= maxFallbacks {
+			break
 		}
+		chain = append(chain, m)
 	}
 	return chain
 }
 
 // execute runs the fallback chain with per-model retry + exponential backoff and
 // jitter. Permanent errors (missing key, model not pulled) skip retries and move
-// straight to the next fallback. Returns the response, the model that produced
-// it, retry count, and last error.
-func (r *Runtime) execute(rc renderContext) (*provider.GenerateResponse, string, int, error) {
+// straight to the next fallback. Context cancellation aborts the whole run
+// immediately; a per-attempt timeout is retried. Returns the response, the model
+// that produced it, retry count, and last error.
+func (r *Runtime) execute(ctx context.Context, rc renderContext) (*provider.GenerateResponse, string, int, error) {
 	var lastErr error
 	usedModel := r.plan.SelectedModel
 	totalRetries := 0
@@ -117,19 +125,34 @@ func (r *Runtime) execute(rc renderContext) (*provider.GenerateResponse, string,
 			continue
 		}
 		for attempt := 0; attempt <= r.spec.Policy.MaxRetries; attempt++ {
-			ctx, cancel := context.WithTimeout(context.Background(), perAttemptTimeout)
-			resp, err := r.providers.Generate(ctx, modelKey, rc.system, rc.user, defaultMaxTokens)
+			// Honour caller cancellation before spending another attempt.
+			if err := ctx.Err(); err != nil {
+				return nil, modelKey, totalRetries, err
+			}
+			attemptCtx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
+			resp, err := r.providers.Generate(attemptCtx, modelKey, rc.system, rc.user, defaultMaxTokens)
 			cancel()
 			if err == nil {
 				return &resp, modelKey, totalRetries, nil
 			}
 			lastErr = err
+			// Caller cancelled (not a per-attempt timeout): stop everything.
+			if errors.Is(err, context.Canceled) {
+				return nil, modelKey, totalRetries, err
+			}
 			if provider.IsPermanent(err) {
 				break // hopeless for this model; try the next fallback
 			}
 			if attempt < r.spec.Policy.MaxRetries {
 				totalRetries++
-				time.Sleep(backoff(attempt))
+				// Interruptible backoff: wake early if the caller cancels.
+				t := time.NewTimer(backoff(attempt))
+				select {
+				case <-t.C:
+				case <-ctx.Done():
+					t.Stop()
+					return nil, modelKey, totalRetries, ctx.Err()
+				}
 			}
 		}
 	}
@@ -146,11 +169,23 @@ func backoff(attempt int) time.Duration {
 	return base + jitter
 }
 
-// Run executes the plan for one user message and returns the result.
+// Run executes the plan for one user message and returns the result. It is a
+// convenience wrapper around RunContext with a background context.
 func (r *Runtime) Run(userMessage string, variables map[string]string) *core.ExecutionResult {
+	return r.RunContext(context.Background(), userMessage, variables)
+}
+
+// RunContext executes the plan for one user message under the caller's context,
+// so deadlines and cancellation propagate into model calls and retry backoff.
+func (r *Runtime) RunContext(ctx context.Context, userMessage string, variables map[string]string) *core.ExecutionResult {
 	result := core.NewExecutionResult(r.plan.PlanID)
 	t0 := time.Now()
 	rc := r.prepare(userMessage, variables)
+
+	execID := execIDFor(ctx, result.RunID)
+	lg := r.logger(execID)
+	traceMeta(&result, execID)
+	lg.Debug("run.start", "model", r.plan.SelectedModel, "streaming", false)
 
 	// Cache lookup — only for prompts safe to reuse (see cache.Cacheable).
 	if cache.Cacheable(rc.cacheKey) {
@@ -162,11 +197,13 @@ func (r *Runtime) Run(userMessage string, variables map[string]string) *core.Exe
 			result.LatencyMS = float64(time.Since(t0).Milliseconds())
 			r.obs.Record(&result)
 			r.captureRouting(rc, &result, false)
+			lg.Info("run.complete", "model", result.ModelUsed, "cached", true,
+				"latency_ms", result.LatencyMS)
 			return &result
 		}
 	}
 
-	resp, usedModel, retries, err := r.execute(rc)
+	resp, usedModel, retries, err := r.execute(ctx, rc)
 	result.Retries = retries
 	if resp == nil {
 		result.Success = false
@@ -175,6 +212,8 @@ func (r *Runtime) Run(userMessage string, variables map[string]string) *core.Exe
 		result.LatencyMS = float64(time.Since(t0).Milliseconds())
 		r.obs.Record(&result)
 		r.captureRouting(rc, &result, usedModel != r.plan.SelectedModel)
+		lg.Error("run.failed", "model", usedModel, "retries", retries,
+			"latency_ms", result.LatencyMS, "err", result.Error)
 		return &result
 	}
 
@@ -195,7 +234,32 @@ func (r *Runtime) Run(userMessage string, variables map[string]string) *core.Exe
 
 	r.obs.Record(&result)
 	r.captureRouting(rc, &result, usedModel != r.plan.SelectedModel)
+	lg.Info("run.complete", "model", usedModel, "cached", false,
+		"retries", retries, "fallback", usedModel != r.plan.SelectedModel,
+		"input_tokens", result.InputTokens, "output_tokens", result.OutputTokens,
+		"cost", result.Cost, "latency_ms", result.LatencyMS)
 	return &result
+}
+
+// execIDFor returns the trace/execution ID from ctx, or a fallback (the run ID).
+func execIDFor(ctx context.Context, fallback string) string {
+	if id := logging.ExecutionID(ctx); id != "" {
+		return id
+	}
+	return fallback
+}
+
+// logger builds a child logger tagged with this run's identifying fields.
+func (r *Runtime) logger(execID string) *slog.Logger {
+	return logging.L().With("execution_id", execID, "plan_id", r.plan.PlanID, "spec", r.spec.Name)
+}
+
+// traceMeta records the execution ID on the result for request tracing linkage.
+func traceMeta(result *core.ExecutionResult, execID string) {
+	if result.Metadata == nil {
+		result.Metadata = map[string]string{}
+	}
+	result.Metadata["execution_id"] = execID
 }
 
 // RunStream executes the plan and streams response deltas to out as they
@@ -203,11 +267,22 @@ func (r *Runtime) Run(userMessage string, variables map[string]string) *core.Exe
 // result once the stream completes. Streaming bypasses cache and fallback to
 // keep the streamed byte order well-defined.
 func (r *Runtime) RunStream(userMessage string, variables map[string]string, out io.Writer) *core.ExecutionResult {
+	return r.RunStreamContext(context.Background(), userMessage, variables, out)
+}
+
+// RunStreamContext is RunStream under the caller's context, so cancellation
+// stops an in-flight stream.
+func (r *Runtime) RunStreamContext(parent context.Context, userMessage string, variables map[string]string, out io.Writer) *core.ExecutionResult {
 	result := core.NewExecutionResult(r.plan.PlanID)
 	t0 := time.Now()
 	rc := r.prepare(userMessage, variables)
 
-	ctx, cancel := context.WithTimeout(context.Background(), perAttemptTimeout)
+	execID := execIDFor(parent, result.RunID)
+	lg := r.logger(execID)
+	traceMeta(&result, execID)
+	lg.Debug("run.start", "model", r.plan.SelectedModel, "streaming", true)
+
+	ctx, cancel := context.WithTimeout(parent, perAttemptTimeout)
 	defer cancel()
 	events, err := r.providers.Stream(ctx, r.plan.SelectedModel, rc.system, rc.user, defaultMaxTokens)
 	if err != nil {
@@ -216,6 +291,7 @@ func (r *Runtime) RunStream(userMessage string, variables map[string]string, out
 		result.ModelUsed = r.plan.SelectedModel
 		result.LatencyMS = float64(time.Since(t0).Milliseconds())
 		r.obs.Record(&result)
+		lg.Error("run.failed", "model", r.plan.SelectedModel, "streaming", true, "err", result.Error)
 		return &result
 	}
 
@@ -228,6 +304,7 @@ func (r *Runtime) RunStream(userMessage string, variables map[string]string, out
 			result.ModelUsed = r.plan.SelectedModel
 			result.LatencyMS = float64(time.Since(t0).Milliseconds())
 			r.obs.Record(&result)
+			lg.Error("run.failed", "model", r.plan.SelectedModel, "streaming", true, "err", result.Error)
 			return &result
 		case ev.Delta != "":
 			io.WriteString(out, ev.Delta)
@@ -250,6 +327,9 @@ func (r *Runtime) RunStream(userMessage string, variables map[string]string, out
 	result.LatencyMS = float64(time.Since(t0).Milliseconds())
 	r.obs.Record(&result)
 	r.captureRouting(rc, &result, false)
+	lg.Info("run.complete", "model", result.ModelUsed, "streaming", true,
+		"input_tokens", result.InputTokens, "output_tokens", result.OutputTokens,
+		"cost", result.Cost, "latency_ms", result.LatencyMS)
 	return &result
 }
 
@@ -273,7 +353,7 @@ func (r *Runtime) captureRouting(rc renderContext, result *core.ExecutionResult,
 	if strategy == "" {
 		strategy = string(core.StrategyAuto)
 	}
-	_ = observability.AppendRouting(r.dataDir+"/observability", observability.RoutingRecord{
+	if err := observability.AppendRouting(r.dataDir+"/observability", observability.RoutingRecord{
 		TaskType:     string(a.Type),
 		Difficulty:   a.Difficulty,
 		Risk:         string(a.Risk),
@@ -286,7 +366,9 @@ func (r *Runtime) captureRouting(rc renderContext, result *core.ExecutionResult,
 		Success:      result.Success,
 		UsedFallback: usedFallback,
 		Cached:       result.Cached,
-	})
+	}); err != nil {
+		logging.L().Warn("routing record persist failed", "err", err)
+	}
 }
 
 func truncate(s string, n int) string {

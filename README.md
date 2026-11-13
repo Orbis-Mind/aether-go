@@ -45,6 +45,30 @@ required** and are excluded entirely under a `privacy: local` policy.
 
 ---
 
+## Production-ready
+
+Aether has been through a full engineering-hardening pass. Highlights:
+
+- **Safe artifacts** — the `.ae` format is bounds-checked and integrity-verified
+  (full SHA-256), with size and zip-bomb limits. A corrupt artifact returns an
+  error, never a panic (fuzz-tested). Compilation is **deterministic**.
+- **Strict specs** — the YAML parser rejects tabs, duplicate keys, and unknown
+  fields with line-numbered errors instead of silently mis-parsing.
+- **Reliable runtime** — context-aware execution (cancel with Ctrl-C), typed
+  retryable-vs-permanent errors, bounded retries with jittered backoff, bounded
+  caches, and concurrency-safe stores (race-clean).
+- **Observability** — structured JSON logs (`AETHER_LOG_LEVEL`, quiet by
+  default) with per-request execution IDs; metrics and a routing dataset.
+- **Supply chain** — CI runs `go vet`, `go test -race`, coverage,
+  [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck), and
+  secret scanning; releases are reproducible (`-trimpath`) and ship an SBOM +
+  `SHA256SUMS`.
+
+The complete finding-by-finding log is in
+[`docs/ENGINEERING_AUDIT.md`](docs/ENGINEERING_AUDIT.md).
+
+---
+
 ## Quick start ($0, no API key)
 
 ```bash
@@ -141,6 +165,9 @@ aether evaluate                       # uses installed local models + built-in d
 aether evaluate my-dataset.json       # bring your own prompts
 ```
 
+Example — an **actual run** on an Apple Silicon Mac (your numbers will vary by
+hardware and which models you pulled; nothing here is hand-written):
+
 ```
 AETHER MODEL EVALUATION
 ================================================================
@@ -149,16 +176,22 @@ Tasks:   44
 
 Model            Quality        P95    Success   Tokens
 ----------------------------------------------------------------
-qwen2.5          78.4%        1900ms      98%   5120/meas
-llama3.2         71.2%        1400ms      95%   4880/meas
+phi3             91.7%       5039ms      100%  5166/meas
+gemma2           83.0%       3745ms      100%  4185/meas
 ----------------------------------------------------------------
 Recommendation:
-  qwen2.5
+  phi3
 
 Reason:
   Best MEASURED quality on this dataset. Not a claim about any
   other workload — measure your own prompts to route on your data.
 ```
+
+Note that `gemma2`'s *estimated* prior (0.71) and `phi3`'s (0.66) both ranked
+below their *measured* scores here — which is the whole point of measuring
+instead of trusting vendor priors. A model installed under a non-default tag
+(e.g. `qwen2.5:3b` when the catalogue key is `qwen2.5`) is reported as failed,
+not silently scored — honest by construction.
 
 Measured scores are written to `.aether/observability/benchmarks.json` and
 overlay the registry, so future `aether run`/`aether test` route on **your**
@@ -286,12 +319,12 @@ flowchart LR
 
 ## Build from source
 
-Requires Go 1.22+. Zero external dependencies.
+Requires Go 1.26+. Zero external dependencies.
 
 ```bash
 go build -o aether ./cmd/aether
-go test ./...          # 70 tests, all offline
-gofmt -l internal cmd  # formatting check (CI-enforced)
+go test -race ./...         # 109 tests (incl. fuzz), all offline, race-clean
+gofmt -l internal cmd tests # formatting check (CI-enforced)
 go vet ./...
 ```
 

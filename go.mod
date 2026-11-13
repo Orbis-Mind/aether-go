@@ -1,3 +1,3 @@
 module github.com/Orbis-Mind/aether
 
-go 1.22
+go 1.26

@@ -19,15 +19,19 @@ type Item struct {
 	Prompt   string `json:"prompt"`
 	// ExpectKeywords: all-or-fraction of these should appear (case-insensitive)
 	// in a good answer. ExpectRegex: the answer should match this pattern.
-	// When neither is set, the item is not quality-scorable (latency/tokens/
+	// ExpectAnswer: a single exact final answer (e.g. a number) graded by the
+	// standard "extract the final answer and compare" method — used for math
+	// benchmarks like GSM8K.
+	// When none is set, the item is not quality-scorable (latency/tokens/
 	// success are still measured) and is reported as such — never fabricated.
 	ExpectKeywords []string `json:"expect_keywords,omitempty"`
 	ExpectRegex    string   `json:"expect_regex,omitempty"`
+	ExpectAnswer   string   `json:"expect_answer,omitempty"`
 }
 
 // Scorable reports whether the item has any deterministic expectation.
 func (it Item) Scorable() bool {
-	return len(it.ExpectKeywords) > 0 || it.ExpectRegex != ""
+	return len(it.ExpectKeywords) > 0 || it.ExpectRegex != "" || it.ExpectAnswer != ""
 }
 
 // Dataset is a named collection of items.
